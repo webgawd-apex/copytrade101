@@ -1,11 +1,3 @@
-
-#!/usr/bin/env python3
-
-"""Personal-scale Solana Telegram copy bot.
-Helius HTTP + Jupiter Swap V2.
-Supports USDC-paired swaps only.
-"""
-
 import asyncio
 import base64
 import html
