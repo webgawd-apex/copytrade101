@@ -1,5 +1,5 @@
 
-name: Deploy Telegram Bot
+name: Deploy Solana Telegram Bot
 
 on:
   push:
@@ -11,29 +11,33 @@ permissions:
   contents: read
 
 concurrency:
-  group: tg-bot-production
+  group: solana-bot-deployment
   cancel-in-progress: false
 
 jobs:
   deploy:
+    name: Deploy to DigitalOcean
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Configure SSH
         env:
-          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
-          KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
-          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
 
-      - name: Upload bot to VPS
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+          chmod 600 ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload Bot Files
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
@@ -41,21 +45,43 @@ jobs:
           rsync -az \
             --exclude='.git/' \
             --exclude='.github/' \
-            --exclude='.venv/' \
             --exclude='.env' \
+            --exclude='.venv/' \
             --exclude='__pycache__/' \
+            --exclude='*.db' \
             -e "ssh -o StrictHostKeyChecking=yes" \
             ./ "$VPS_USER@$VPS_HOST:/opt/tg-bot/"
 
-      - name: Install dependencies and restart bot
+      - name: Install Dependencies
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           ssh -o StrictHostKeyChecking=yes \
-            "$VPS_USER@$VPS_HOST" \
-            'set -e
-             cd /opt/tg-bot
-             .venv/bin/python -m pip install -r requirements.txt
-             sudo -n /usr/bin/systemctl restart tg-bot.service
-             sudo -n /usr/bin/systemctl is-active tg-bot.service'
+            "$VPS_USER@$VPS_HOST" << 'EOF'
+          set -e
+
+          cd /opt/tg-bot
+
+          .venv/bin/python -m pip install \
+            -r requirements.txt
+          EOF
+
+      - name: Restart Telegram Bot
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh -o StrictHostKeyChecking=yes \
+            "$VPS_USER@$VPS_HOST" << 'EOF'
+          set -e
+
+          sudo -n /usr/bin/systemctl restart tg-bot.service
+
+          sleep 3
+
+          sudo -n /usr/bin/systemctl is-active \
+            --quiet tg-bot.service
+
+          echo "Deployment successful"
+          EOF
