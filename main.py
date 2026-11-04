@@ -1,4 +1,3 @@
-                            short(master["address"]),
                         )
 
             except asyncio.CancelledError:
