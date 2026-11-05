@@ -1,5 +1,5 @@
 
-"""Solana Telegram Copy Trader — single-file application."""
+"""Solana Telegram Copy Trader."""
 import asyncio
 import base64
 import html
