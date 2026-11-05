@@ -12,6 +12,7 @@ import sys
 import time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qs
 
 import aiohttp
 import asyncpg
@@ -34,16 +35,23 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 LOG = logging.getLogger("copybot")
 
 TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-HELIUS = os.getenv("HELIUS_KEY")
 DSN = os.getenv("DATABASE_URL")
 JUP_KEY = os.getenv("JUPITER_API_KEY", "")
-if not all((TOKEN, HELIUS, DSN)):
-    raise SystemExit("Set TELEGRAM_TOKEN, HELIUS_KEY and DATABASE_URL")
+RPC = os.getenv("HELIUS_RPC_URL", "").strip()
+if not TOKEN or not DSN or not RPC:
+    raise SystemExit("Set TELEGRAM_TOKEN, DATABASE_URL and HELIUS_RPC_URL")
+parsed_rpc = urlsplit(RPC)
+if (parsed_rpc.scheme != "https" or
+        parsed_rpc.hostname != "mainnet.helius-rpc.com" or
+        not parse_qs(parsed_rpc.query).get("api-key", [""])[0]):
+    raise SystemExit("HELIUS_RPC_URL must be a valid Helius mainnet HTTPS RPC URL")
 
-RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS}"
-PARSE = f"https://api-mainnet.helius-rpc.com/v0/transactions/?api-key={HELIUS}"
 JUP = "https://api.jup.ag/swap/v2"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+WSOL = "So11111111111111111111111111111111111111112"
+QUOTE_MINTS = {USDC, WSOL}
+MAX_SIGNAL_AGE = 30
+
 TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 ATA_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 USDC_MINT = Pubkey.from_string(USDC)
@@ -212,6 +220,7 @@ class BotService:
         self.lock = asyncio.Lock()
         self.rpc_limit = asyncio.Semaphore(4)
         self.busy = set()
+        self.last_monitor_alert = {}
 
     async def startup(self, app):
         self.app = app
@@ -250,16 +259,21 @@ class BotService:
             await self.pool.close()
 
     async def rpc(self, method, params):
+        # Do not emit the authenticated RPC URL into error messages or logs.
         async with self.rpc_limit:
             async with self.session.post(RPC, json={
                 "jsonrpc": "2.0", "id": 1,
                 "method": method, "params": params
             }) as response:
-                response.raise_for_status()
+                if response.status != 200:
+                    raise RuntimeError(f"Helius RPC {method} returned HTTP {response.status}")
                 data = await response.json()
                 if data.get("error"):
-                    raise RuntimeError(f"RPC request failed: {method}")
-                return data["result"]
+                    error = data["error"]
+                    raise RuntimeError(
+                        f"Helius RPC {method} failed (code {error.get('code', 'unknown')})"
+                    )
+                return data.get("result")
 
     async def user(self, uid):
         await self.pool.execute(
@@ -488,7 +502,7 @@ class BotService:
                 f"Max trade: <b>${u['max_usd']:.2f}</b>\n"
                 f"Slippage: <b>{Decimal(u['slip_bps'])/100}%</b>\n"
                 f"Wallet: <code>{address}</code>\n\n"
-                "Copies supported USDC-paired swaps."
+                "Copies eligible master trades using your USDC balance."
             )
             rows = [
                 [("⏸ Pause" if u["enabled"] else "▶️ Enable Auto Trade", "toggle")],
@@ -997,21 +1011,67 @@ class BotService:
                 raise RuntimeError("Jupiter execution failed.")
             return data
 
-    def classify_swap(self, tx):
-        if not tx or tx.get("type") != "SWAP":
-            return None
-        swap = (tx.get("events") or {}).get("swap") or {}
-        incoming = swap.get("tokenInputs") or []
-        outgoing = swap.get("tokenOutputs") or []
-        if len(incoming) != 1 or len(outgoing) != 1:
-            return None
-        source = incoming[0].get("mint")
-        dest = outgoing[0].get("mint")
-        if source == USDC and dest != USDC:
-            return "BUY", dest
-        if dest == USDC and source != USDC:
-            return "SELL", source
-        return None
+    def classify_swap(self, tx, master):
+        """Conservative balance-delta detection from standard Solana RPC getTransaction.
+
+        Validates that an actual swap instruction ran, then compares the
+        watched owner's SPL and native SOL balances, not the fee payer.
+        The bot only executes USDC-funded copies, even when master spent SOL.
+        """
+        if not tx or not tx.get("meta") or tx["meta"].get("err"):
+            return None, "Transaction failed or unavailable"
+        meta = tx["meta"]
+        logs = " ".join(meta.get("logMessages") or []).lower()
+        # Avoid treating incoming gifts, outgoing transfers, and mints as swaps.
+        if not any(word in logs for word in (
+            "instruction: swap", "instruction: route", "instruction: buy",
+            "instruction: sell", "instruction: sharedaccountsroute",
+            "instruction: exactoutroute", "swapbasein", "swapbaseout",
+        )):
+            return None, "No recognizable swap instruction"
+
+        def owner_amounts(entries):
+            balances = {}
+            for item in entries or []:
+                if item.get("owner") != master:
+                    continue
+                mint = item.get("mint")
+                if not mint:
+                    continue
+                raw = int((item.get("uiTokenAmount") or {}).get("amount", "0"))
+                balances[mint] = balances.get(mint, 0) + raw
+            return balances
+
+        before = owner_amounts(meta.get("preTokenBalances"))
+        after = owner_amounts(meta.get("postTokenBalances"))
+        changes = {m: after.get(m, 0) - before.get(m, 0)
+                   for m in before.keys() | after.keys()}
+        pos = [(m, v) for m, v in changes.items() if v > 0 and m not in QUOTE_MINTS]
+        neg = [(m, v) for m, v in changes.items() if v < 0 and m not in QUOTE_MINTS]
+        spent_quote = any(changes.get(q, 0) < 0 for q in QUOTE_MINTS)
+        gained_quote = any(changes.get(q, 0) > 0 for q in QUOTE_MINTS)
+
+        # The owner can spend native SOL, including when the fee payer differs.
+        keys = (tx.get("transaction") or {}).get("message", {}).get("accountKeys", [])
+        keys = [k.get("pubkey") if isinstance(k, dict) else k for k in keys]
+        if master in keys:
+            i = keys.index(master)
+            pre_sol = (meta.get("preBalances") or [])[i]
+            post_sol = (meta.get("postBalances") or [])[i]
+            fee = int(meta.get("fee") or 0) if keys and keys[0] == master else 0
+            sol_delta = int(post_sol) - int(pre_sol) + fee
+            if sol_delta < -1_000_000:
+                spent_quote = True
+            if sol_delta > 1_000_000:
+                gained_quote = True
+
+        if len(pos) == 1 and not neg and spent_quote:
+            return ("BUY", pos[0][0]), ""
+        if len(neg) == 1 and not pos and gained_quote:
+            return ("SELL", neg[0][0]), ""
+        if len(pos) == 1 and len(neg) == 1:
+            return None, "Token-to-token swap requires explicit copying policy"
+        return None, "Swap could not be classified unambiguously"
 
     async def notify(self, uid, message):
         try:
@@ -1033,7 +1093,7 @@ class BotService:
         tid = row["id"]
         try:
             u = await self.user(uid)
-            if not u["enabled"] or time.time() - observed > 20:
+            if not u["enabled"] or time.time() - observed > MAX_SIGNAL_AGE:
                 raise ValueError("Trading disabled or signal expired.")
             if side == "BUY" and not u["copy_buys"]:
                 raise ValueError("Buy copying disabled.")
@@ -1084,6 +1144,9 @@ class BotService:
                 UPDATE copy_trades SET status='SKIPPED',message=$2
                 WHERE id=$1
             """, tid, str(exc)[:250])
+            await self.notify(
+                uid, f"⚠️ Copy {side} skipped: {html.escape(str(exc))}"
+            )
         except Exception as exc:
             await self.pool.execute("""
                 UPDATE copy_trades SET status='UNKNOWN',message=$2
@@ -1099,65 +1162,96 @@ class BotService:
             "SELECT signature FROM copy_cursors WHERE address=$1", address
         )
         entries = await self.rpc("getSignaturesForAddress", [
-            address, {"limit": 20, "commitment": "confirmed"}
+            address, {"limit": 50, "commitment": "confirmed"}
         ])
         if not entries:
             return
         newest = entries[0]["signature"]
         if previous is None:
+            # First observation establishes a safe baseline: do not replay history.
             await self.pool.execute("""
                 INSERT INTO copy_cursors(address,signature)
                 VALUES($1,$2) ON CONFLICT DO NOTHING
             """, address, newest)
             return
-        fresh = []
-        for item in entries:
-            if item["signature"] == previous:
-                break
-            age = time.time() - item["blockTime"] if item.get("blockTime") else 999999
-            if not item.get("err") and age < 20:
-                fresh.append(item)
-        if not any(x["signature"] == previous for x in entries):
+        seen = any(x["signature"] == previous for x in entries)
+        if not seen:
+            LOG.warning("History gap for monitored wallet %s; automatic replay blocked", shortened(address))
+            # Don't silently skip an unknown volume of trades; pause followers.
+            await self.pool.execute("""
+                UPDATE copy_users SET enabled=FALSE
+                WHERE id IN (SELECT m.user_id FROM copy_masters m
+                             WHERE m.address=$1 AND m.active)
+            """, address)
+            await self.alert_monitor(address, "History gap detected. Auto trading paused; review wallet activity.")
             await self.pool.execute("""
                 UPDATE copy_cursors SET signature=$2 WHERE address=$1
             """, address, newest)
             return
+
+        fresh = []
+        for item in entries:
+            if item["signature"] == previous:
+                break
+            if not item.get("err"):
+                fresh.append(item)
+
+        # Do not advance checkpoint when an API error occurs. On return the
+        # oldest unprocessed signature remains eligible for the next poll.
         for item in reversed(fresh):
-            sig = item["signature"]
-            async with self.session.post(
-                PARSE, json={"transactions": [sig]}
-            ) as response:
-                response.raise_for_status()
-                parsed = await response.json()
-            if not parsed:
-                continue
-            tx = parsed[0]
-            if tx.get("feePayer") != address:
-                continue
-            swap = self.classify_swap(tx)
-            if not swap:
-                continue
-            side, mint = swap
-            followers = await self.pool.fetch("""
-                SELECT m.user_id FROM copy_masters m
-                JOIN copy_users u ON u.id=m.user_id
-                WHERE m.address=$1 AND m.active AND u.enabled
-            """, address)
-            for follower in followers:
-                uid = follower["user_id"]
-                if uid in self.busy:
-                    continue
-                self.busy.add(uid)
-                try:
-                    await self.execute_copy(
-                        uid, address, sig, side, mint,
-                        item.get("blockTime") or time.time()
-                    )
-                finally:
-                    self.busy.discard(uid)
-        await self.pool.execute("""
-            UPDATE copy_cursors SET signature=$2 WHERE address=$1
-        """, address, newest)
+            signature = item["signature"]
+            age = time.time() - (item.get("blockTime") or 0)
+            if 0 <= age <= MAX_SIGNAL_AGE:
+                tx = await self.rpc("getTransaction", [signature, {
+                    "encoding": "jsonParsed", "commitment": "confirmed",
+                    "maxSupportedTransactionVersion": 0
+                }])
+                if tx is None:
+                    raise RuntimeError("RPC transaction details not ready")
+                swap, reason = self.classify_swap(tx, address)
+                if swap:
+                    side, mint = swap
+                    followers = await self.pool.fetch("""
+                        SELECT m.user_id FROM copy_masters m
+                        JOIN copy_users u ON u.id=m.user_id
+                        WHERE m.address=$1 AND m.active AND u.enabled
+                    """, address)
+                    for follower in followers:
+                        uid = follower["user_id"]
+                        if uid in self.busy:
+                            # Busy signals are not safely requeued by this baseline.
+                            await self.notify(uid, "⚠️ New trade detected but another copy is running.")
+                            continue
+                        self.busy.add(uid)
+                        try:
+                            await self.execute_copy(
+                                uid, address, signature, side, mint,
+                                item.get("blockTime") or time.time()
+                            )
+                        finally:
+                            self.busy.discard(uid)
+                else:
+                    LOG.info("Ignored transaction %s: %s", shortened(signature), reason)
+            else:
+                LOG.info("Stale transaction %s: not copied", shortened(signature))
+            # Durable progress after successful parsing, or explicit skip.
+            await self.pool.execute("""
+                INSERT INTO copy_cursors(address,signature) VALUES($1,$2)
+                ON CONFLICT(address) DO UPDATE SET signature=EXCLUDED.signature
+            """, address, signature)
+
+    async def alert_monitor(self, address, message):
+        now = time.monotonic()
+        if now - self.last_monitor_alert.get(address, 0) < 300:
+            return
+        self.last_monitor_alert[address] = now
+        rows = await self.pool.fetch("""
+            SELECT DISTINCT m.user_id FROM copy_masters m
+            JOIN copy_users u ON u.id=m.user_id
+            WHERE m.address=$1 AND m.active
+        """, address)
+        for row in rows:
+            await self.notify(row["user_id"], "⚠️ Wallet monitoring: " + message)
 
     async def monitor(self):
         while True:
@@ -1170,8 +1264,12 @@ class BotService:
                 for master in masters:
                     try:
                         await self.poll_master(master["address"])
-                    except Exception:
-                        LOG.exception("Wallet monitoring error")
+                    except Exception as exc:
+                        LOG.error("Wallet monitoring error (%s)", type(exc).__name__)
+                        await self.alert_monitor(
+                            master["address"],
+                            "Transaction processing failed. New trades may be missed; check monitoring."
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
