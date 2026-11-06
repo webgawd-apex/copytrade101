@@ -1,12 +1,15 @@
 """Solana Telegram Copy Trader — single-file application."""
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
 import os
 import secrets
 import struct
+import sys
+from getpass import getpass
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -16,7 +19,10 @@ from urllib.parse import urlsplit, parse_qs
 import aiohttp
 import asyncpg
 import base58
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.hash import Hash
@@ -39,13 +45,6 @@ TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 DSN = os.getenv("DATABASE_URL")
 JUP_KEY = os.getenv("JUPITER_API_KEY", "")
 RPC = os.getenv("HELIUS_RPC_URL", "").strip()
-if not TOKEN or not DSN or not RPC:
-    raise SystemExit("Set TELEGRAM_TOKEN, DATABASE_URL and HELIUS_RPC_URL")
-parsed_rpc = urlsplit(RPC)
-if (parsed_rpc.scheme != "https" or
-        parsed_rpc.hostname != "mainnet.helius-rpc.com" or
-        not parse_qs(parsed_rpc.query).get("api-key", [""])[0]):
-    raise SystemExit("HELIUS_RPC_URL must be a valid Helius mainnet HTTPS RPC URL")
 
 JUP = "https://api.jup.ag/swap/v2"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -54,9 +53,11 @@ USDT = "Es9vMFrzaCER1LEJzKSSGfYxj7ZLyuuz3QfbD7cGoE"
 QUOTE_MINTS = {USDC, USDT, WSOL}
 # User-configurable trading settings are persisted in PostgreSQL, not .env.
 # Only credentials/infrastructure values belong in /etc/tg-bot.env.
-DEFAULT_SLIPPAGE_BPS = 2000  # 20%
-MIN_SOL_RESERVE = 10_000_000  # 0.01 SOL fee/rent reserve
+DEFAULT_SLIPPAGE_BPS = 100
+MIN_SOL_RESERVE = 5_000_000  # Fees and rent for up to two standard token accounts
 MAX_SLIPPAGE_BPS = 7000
+PUMPPORTAL_FEE_RECIPIENT = "7FeFBYbewCqXG7LP6gC8Fnqzk7hmQFMtntXVRqnXi4g6"
+PUMPPORTAL_FEE_BPS = 50
 PUMPPORTAL_URL = "https://pumpportal.fun/api/trade-local"
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -67,17 +68,41 @@ TOKEN_2022_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 ATA_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 COMPUTE_BUDGET_ID = "ComputeBudget111111111111111111111111111111"
 SYSTEM_ID = str(SYSTEM_PROGRAM_ID)
-EXTRA_PORTAL_PROGRAMS = {
-    x.strip() for x in os.getenv("EXTRA_PORTAL_PROGRAMS", "").split(",") if x.strip()
-}
 PORTAL_ALLOWED_PROGRAMS = {
-    PUMP_PROGRAM, PUMPSWAP_PROGRAM, PUMP_FEE_PROGRAM, ATA_PROGRAM_ID,
+    PUMP_PROGRAM, PUMPSWAP_PROGRAM, ATA_PROGRAM_ID,
     TOKEN_PROGRAM_ID, TOKEN_2022_ID, SYSTEM_ID, COMPUTE_BUDGET_ID,
-} | EXTRA_PORTAL_PROGRAMS
+}
+# Anchor instruction discriminators from the published Pump and PumpSwap IDLs.
+SWAP_NAMES = {
+    hashlib.sha256(f"global:{name}".encode()).digest()[:8]: name
+    for name in ("buy", "sell", "buy_exact_sol_in", "buy_exact_quote_in",
+                 "buy_v2", "sell_v2", "buy_exact_quote_in_v2")
+}
+
+
+RAY_V4 = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+DIRECT_SWAP_PROGRAMS = {
+    RAY_V4,
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+}
+DIRECT_SWAP_DISCRIMINATORS = {
+    hashlib.sha256(f"global:{name}".encode()).digest()[:8]
+    for name in ("swap", "swap_v2", "swap_base_input", "swap_base_output",
+                 "swap_exact_out", "swap2", "swap_exact_out2", "two_hop_swap", "two_hop_swap_v2")
+}
+
+
+def token_account(owner, mint, program):
+    seeds = [bytes(Pubkey.from_string(k)) for k in (owner, program, mint)]
+    return str(Pubkey.find_program_address(seeds, Pubkey.from_string(ATA_PROGRAM_ID))[0])
+
+
 PRIORITY_FEE_SOL = Decimal("0.0001")
 MAX_PRIORITY_LAMPORTS = 5_000_000
 PORTAL_RENT_ALLOWANCE = 10_000_000
-SIGNATURE_EXPIRY_SECONDS = 120
 UNRESOLVED = ["SIGNED", "SUBMITTED", "UNKNOWN", "SUBMITTING"]
 TRADE_CONCURRENCY = 4
 
@@ -91,6 +116,7 @@ STATUS_WORDS = {
     "SKIPPED": "Skipped",
     "FAILED": "Failed ❌",
     "UNKNOWN": "Checking",
+    "EXPIRED": "Expired (no receipt)",
 }
 VIA_WORDS = {"jupiter": "Jupiter", "pumpportal": "Pump.fun fast mode"}
 
@@ -103,9 +129,9 @@ CREATE TABLE IF NOT EXISTS copy_users (
  id BIGINT PRIMARY KEY,
  enabled BOOLEAN NOT NULL DEFAULT FALSE,
  max_usd NUMERIC(12,2) NOT NULL DEFAULT 10,
- slip_bps INTEGER NOT NULL DEFAULT 2000,
+ slip_bps INTEGER NOT NULL DEFAULT 100,
  copy_buys BOOLEAN NOT NULL DEFAULT TRUE,
- copy_sells BOOLEAN NOT NULL DEFAULT FALSE,
+ copy_sells BOOLEAN NOT NULL DEFAULT TRUE,
  address TEXT,
  encrypted_secret TEXT,
  poll_interval_seconds NUMERIC(4,1) NOT NULL DEFAULT 1.5,
@@ -174,19 +200,27 @@ CREATE TABLE IF NOT EXISTS copy_withdrawals (
 """
 
 MIGRATIONS = (
+    "ALTER TABLE copy_users ALTER COLUMN copy_sells SET DEFAULT TRUE",
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS poll_interval_seconds NUMERIC(4,1) NOT NULL DEFAULT 1.5",
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS max_signal_age_seconds INTEGER NOT NULL DEFAULT 90",
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS allow_usdc_fallback BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS use_pumpportal BOOLEAN NOT NULL DEFAULT FALSE",
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS enabled_since TIMESTAMPTZ",
-    "ALTER TABLE copy_users ALTER COLUMN slip_bps SET DEFAULT 2000",
+    "ALTER TABLE copy_users ALTER COLUMN slip_bps SET DEFAULT 100",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS block_time BIGINT",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS fraction NUMERIC",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS venue TEXT",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS route TEXT",
+    "ALTER TABLE copy_masters ADD COLUMN IF NOT EXISTS active_since TIMESTAMPTZ NOT NULL DEFAULT now()",
+    "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS wallet_address TEXT",
+    "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS recent_blockhash TEXT",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS signed_at TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS copy_trades_status_idx ON copy_trades(status)",
 )
+
+
+class PreflightRejected(Exception):
+    """The RPC rejected a transaction in preflight, before forwarding it."""
 
 
 class SendUncertain(Exception):
@@ -252,6 +286,22 @@ def import_key(value):
     raise ValueError("That private key doesn't look right. Please check it and try again.")
 
 
+def import_cipher(private, peer):
+    shared = private.exchange(X25519PublicKey.from_public_bytes(peer))
+    derived = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                   info=b"copybot-wallet-import-v1").derive(shared)
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+def seal_wallet(public_hex):
+    if not sys.stdin.isatty():
+        raise ValueError("Run wallet import in an interactive terminal")
+    key = import_key(getpass("Wallet key (hidden): "))
+    ephemeral = X25519PrivateKey.generate()
+    cipher = import_cipher(ephemeral, bytes.fromhex(public_hex))
+    print(ephemeral.public_key().public_bytes_raw().hex() + "." + cipher.encrypt(bytes(key)).decode())
+
+
 def encryption_key():
     path = Path("/var/lib/tg-bot/wallet.key")
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -300,6 +350,8 @@ def detect_venue(programs):
         return "pumpswap"
     if JUP_PROGRAM in programs:
         return "jupiter"
+    if programs & DIRECT_SWAP_PROGRAMS:
+        return "dex"
     return "other"
 
 
@@ -318,6 +370,8 @@ class BotService:
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
+        self.alert_queues = [asyncio.Queue(maxsize=128) for _ in range(4)]
+        self.alert_workers = []
         self.hot_addresses = set()
         self.poll_locks = {}
         self.wallet_locks = {}
@@ -328,8 +382,7 @@ class BotService:
 
     # ------------------------------------------------------------------ lifecycle
     async def startup(self, app):
-        if not JUP_KEY:
-            raise RuntimeError("JUPITER_API_KEY is required for this live-only bot")
+
         self.app = app
         self.fernet = encryption_key()
         self.pool = await asyncpg.create_pool(DSN, min_size=1, max_size=6)
@@ -367,6 +420,7 @@ class BotService:
                 "🛑 <b>Auto trading paused</b>\nA trade was still being checked when the "
                 "bot restarted. I'll message you as soon as it's sorted out."
             )
+        self.alert_workers = [asyncio.create_task(self.alert_worker(q)) for q in self.alert_queues]
         self.monitor_task = asyncio.create_task(self.monitor())
         self.ws_task = asyncio.create_task(self.websocket_monitor())
         self.cleanup_task = asyncio.create_task(self.cleanup_keys())
@@ -386,7 +440,7 @@ class BotService:
 
     async def shutdown(self, app):
         for task in (self.monitor_task, self.cleanup_task, self.ws_task,
-                     self.worker_task, self.reconcile_task):
+                     self.worker_task, self.reconcile_task, *self.alert_workers):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -402,9 +456,9 @@ class BotService:
             await self.pool.close()
 
     # ------------------------------------------------------------------ rpc + data
-    async def rpc(self, method, params):
+    async def rpc(self, method, params, endpoint=None):
         async with self.rpc_limit:
-            async with self.session.post(RPC, json={
+            async with self.session.post(endpoint or RPC, json={
                 "jsonrpc": "2.0", "id": 1,
                 "method": method, "params": params
             }) as response:
@@ -413,6 +467,10 @@ class BotService:
                 data = await response.json()
                 if data.get("error"):
                     error = data["error"]
+                    details = error.get("data")
+                    if (method == "sendTransaction" and error.get("code") == -32002
+                            and isinstance(details, dict) and details.get("err") is not None):
+                        raise PreflightRejected(str(details["err"])[:140])
                     raise RuntimeError(
                         f"Helius RPC {method} failed (code {error.get('code', 'unknown')})"
                     )
@@ -537,29 +595,6 @@ class BotService:
                 LOG.exception("Temporary-message cleanup failed")
             await asyncio.sleep(15)
 
-    async def reveal(self, uid, wid):
-        w = await self.wallet(uid, wid)
-        if not w:
-            raise ValueError("Wallet not found.")
-        secret = str(Keypair.from_bytes(
-            self.fernet.decrypt(w["encrypted_secret"].encode())
-        ))
-        msg = await self.app.bot.send_message(
-            uid,
-            f"🔑 <b>Private Key</b>\n\n<code>{html.escape(secret)}</code>\n\n"
-            "Don't share this with anyone. It disappears in 1 hour.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard([
-                [("📋 Copy Private Key", "copy", secret)]
-            ]),
-            protect_content=True,
-        )
-        await self.pool.execute("""
-            INSERT INTO copy_secret_messages(chat_id,message_id,expires_at)
-            VALUES($1,$2,now()+interval '1 hour')
-            ON CONFLICT DO NOTHING
-        """, uid, msg.message_id)
-
     async def notify(self, uid, message):
         try:
             await self.app.bot.send_message(
@@ -589,11 +624,8 @@ class BotService:
                 [signature], {"searchTransactionHistory": True}
             ])
             state = ((result or {}).get("value") or [None])[0]
-            if state:
-                if state.get("err") is not None:
-                    return "FAILED"
-                if state.get("confirmationStatus") in ("confirmed", "finalized"):
-                    return "CONFIRMED"
+            if state and state.get("confirmationStatus") in ("confirmed", "finalized"):
+                return "FAILED" if state.get("err") is not None else "CONFIRMED"
             if time.monotonic() >= deadline:
                 return "PENDING"
             await asyncio.sleep(1.0)
@@ -663,7 +695,7 @@ class BotService:
                         "encoding": "base64",
                         "skipPreflight": False,
                         "preflightCommitment": "confirmed",
-                        "maxRetries": 0,
+                        "maxRetries": 3,
                     }
                 ])
             except Exception as exc:
@@ -765,7 +797,6 @@ class BotService:
                 [("📋 Copy Address", "copy", w["address"])],
                 [("📤 Send SOL", f"send:{wid}:SOL"),
                  ("📤 Send USDC", f"send:{wid}:USDC")],
-                [("🔑 Private Key", f"key:{wid}")],
             ]
             if not is_active:
                 rows.append([("✅ Set Active", f"active:{wid}")])
@@ -808,20 +839,12 @@ class BotService:
                 f"Slippage: {pct(u['slip_bps'])}\n"
                 f"Copy buys: {'ON' if u['copy_buys'] else 'OFF'}\n"
                 f"Copy sells: {'ON' if u['copy_sells'] else 'OFF'}\n"
-                f"Check speed: every {u['poll_interval_seconds']} sec\n"
-                f"Ignore trades older than: {u['max_signal_age_seconds']} sec\n"
-                f"Use USDC if no SOL: {'ON' if u['allow_usdc_fallback'] else 'OFF'}\n"
-                f"Pump.fun fast mode: {'ON' if u['use_pumpportal'] else 'OFF'}"
             )
             return text, keyboard([
                 [("💵 Max Trade", "edit:max"),
                  ("📉 Slippage", "edit:slip")],
                 [("🔁 Buys", "setting:buy"),
                  ("🔁 Sells", "setting:sell")],
-                [("⏱ Check speed", "edit:poll"),
-                 ("⌛ Trade age", "edit:age")],
-                [("💱 Use USDC if no SOL", "setting:usdc")],
-                [("🚀 Pump.fun fast mode", "setting:pump")],
                 [("🛑 Stop Now", "estop")],
                 [("🏠 Home", "home")],
             ])
@@ -845,8 +868,9 @@ class BotService:
                 via = VIA_WORDS.get(t["route"] or "")
                 if via:
                     line += f" • Via: {via}"
-                if t["status"] == "SKIPPED" and t["message"]:
+                if t["message"] and t["status"] in ("SKIPPED", "UNKNOWN", "FAILED", "CONFIRMED", "EXPIRED"):
                     line += f"\n<i>{html.escape(str(t['message'])[:110])}</i>"
+                rows.append([("Master transaction", f"url:https://solscan.io/tx/{t['master_signature']}")])
                 lines.append(line)
                 if t["signature"]:
                     rows.append([
@@ -924,11 +948,13 @@ class BotService:
                 return await self.show(update, "wallet", str(exc))
 
         if data == "import":
-            ctx.user_data["pending"] = ("import",)
+            ephemeral = X25519PrivateKey.generate()
+            public = ephemeral.public_key().public_bytes_raw().hex()
+            ctx.user_data["pending"] = ("import", ephemeral, time.monotonic())
             return await q.edit_message_text(
-                "📥 Send your wallet's private key here.\n"
-                "I'll delete your message right after.\n"
-                "Send /cancel to go back."
+                "On your own computer, run this project command and enter the wallet key "
+                "at its hidden prompt. Send only the encrypted output here within five minutes.\n\n"
+                f"python main.py --seal-wallet {public}"
             )
 
         if data.startswith("walletview:"):
@@ -936,11 +962,7 @@ class BotService:
             return await self.show(update, data)
 
         if data.startswith("key:"):
-            try:
-                await self.reveal(uid, int(data.split(":")[1]))
-            except ValueError as exc:
-                await q.message.reply_text(str(exc))
-            return
+            return await self.show(update, "wallet", "Wallet keys are kept encrypted on the server.")
 
         if data.startswith("active:"):
             wid = int(data.split(":")[1])
@@ -960,7 +982,7 @@ class BotService:
             return await q.edit_message_text(
                 "🗑 <b>Delete this wallet?</b>\n\n"
                 f"<code>{w['address']}</code>\n\n"
-                "Save its private key first. Any funds stay in the wallet.",
+                "Transfer remaining funds before deleting this wallet.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard([
                     [("✅ Delete", f"delconfirm:{nonce}")],
@@ -1084,8 +1106,6 @@ class BotService:
             column = {
                 "buy": "copy_buys",
                 "sell": "copy_sells",
-                "usdc": "allow_usdc_fallback",
-                "pump": "use_pumpportal",
             }.get(data.split(":")[1])
             if column:
                 await self.pool.execute(
@@ -1166,7 +1186,15 @@ class BotService:
                     await update.message.delete()
                 except (BadRequest, Forbidden):
                     pass
-                key = import_key(value)
+                if time.monotonic() - pending[2] > 300:
+                    ctx.user_data.pop("pending", None)
+                    raise ValueError("Import expired. Tap Import again.")
+                try:
+                    peer, payload = value.split(".", 1)
+                    cipher = import_cipher(pending[1], bytes.fromhex(peer))
+                    key = Keypair.from_bytes(cipher.decrypt(payload.encode(), ttl=300))
+                except (InvalidToken, ValueError) as exc:
+                    raise ValueError("Invalid encrypted import. Use the local seal-wallet command.") from exc
                 wid = await self.save_wallet(uid, key)
                 ctx.user_data.pop("pending", None)
                 return await self.show(update, f"walletview:{wid}", "Wallet added.")
@@ -1231,7 +1259,7 @@ class BotService:
                     ctx.user_data["pending"] = ("nickname", value)
                     return await update.message.reply_text("Enter a nickname for this master.")
                 await self.pool.execute(
-                    "UPDATE copy_masters SET address=$3 WHERE id=$1 AND user_id=$2",
+                    "UPDATE copy_masters SET address=$3,active_since=now() WHERE id=$1 AND user_id=$2",
                     pending[1], uid, value
                 )
                 ctx.user_data.pop("pending", None)
@@ -1302,7 +1330,7 @@ class BotService:
             "publicKey": wallet,
             "action": side.lower(),
             "mint": mint,
-            "amount": amount if isinstance(amount, str) else str(amount),
+            "amount": format(amount, "f"),
             "denominatedInSol": "true" if side == "BUY" else "false",
             "slippage": float(Decimal(slip) / 100),
             "priorityFee": float(PRIORITY_FEE_SOL),
@@ -1321,7 +1349,45 @@ class BotService:
                 raise RuntimeError("Invalid PumpPortal serialized transaction")
             return blob
 
-    def validate_portal_tx(self, blob, key, side, mint, spend_lamports, slip_bps):
+    async def lookup_keys(self, blob):
+        lookups = list(getattr(VersionedTransaction.from_bytes(blob).message, "address_table_lookups", ()))
+        if not lookups:
+            return []
+        result = await self.rpc("getMultipleAccounts", [
+            [str(table.account_key) for table in lookups], {"encoding": "base64", "commitment": "confirmed"}
+        ])
+        writable, readonly = [], []
+        for table, account in zip(lookups, result["value"], strict=True):
+            if not account or account["owner"] != "AddressLookupTab1e1111111111111111111111111":
+                raise ValueError("Invalid lookup table")
+            raw = base64.b64decode(account["data"][0], validate=True)
+            if len(raw) < 56 or raw[:4] != bytes([1, 0, 0, 0]) or (len(raw) - 56) % 32:
+                raise ValueError("Invalid lookup table data")
+            addresses = [str(Pubkey.from_bytes(raw[i:i+32])) for i in range(56, len(raw), 32)]
+            for indices, target in ((table.writable_indexes, writable), (table.readonly_indexes, readonly)):
+                for index in indices:
+                    if index >= len(addresses):
+                        raise ValueError("Invalid lookup index")
+                    target.append(addresses[index])
+        return writable + readonly
+
+    async def curve_spot(self, mint):
+        program = Pubkey.from_string(PUMP_PROGRAM)
+        address, _ = Pubkey.find_program_address([b"bonding-curve", bytes(Pubkey.from_string(mint))], program)
+        result = await self.rpc("getAccountInfo", [str(address), {"encoding": "base64", "commitment": "confirmed"}])
+        account = result["value"]
+        if not account or account["owner"] != PUMP_PROGRAM:
+            raise ValueError("Curve unavailable")
+        data = base64.b64decode(account["data"][0], validate=True)
+        if (len(data) < 49 or data[:8] != hashlib.sha256(b"account:BondingCurve").digest()[:8]
+                or data[48] or any(data[83:115])):
+            raise ValueError("Unsupported or completed SOL curve")
+        token, sol = struct.unpack_from("<QQ", data, 8)
+        if not token or not sol:
+            raise ValueError("Empty curve")
+        return Decimal(sol) / token
+
+    def validate_portal_tx(self, blob, key, side, mint, spend_lamports, slip_bps, resolved=(), fee_limit=None):
         """Strict validation of the third-party transaction. Raises ValueError if unsafe."""
         tx = VersionedTransaction.from_bytes(blob)
         msg = tx.message
@@ -1330,9 +1396,17 @@ class BotService:
         if msg.header.num_required_signatures != 1 or not keys or keys[0] != wallet:
             raise ValueError("PumpPortal transaction has unexpected signer/fee payer")
         lookups = list(getattr(msg, "address_table_lookups", []) or [])
-        if not lookups and mint not in keys:
+        if len(resolved) != sum(len(t.writable_indexes) + len(t.readonly_indexes) for t in lookups):
+            raise ValueError("Missing lookup keys")
+        keys.extend(resolved)
+        if mint not in keys:
             raise ValueError("PumpPortal transaction does not reference the target mint")
 
+        wrapped = token_account(wallet, WSOL, TOKEN_PROGRAM_ID)
+        if fee_limit is None:
+            fee_limit = spend_lamports * PUMPPORTAL_FEE_BPS // 10_000 if side == "BUY" else 0
+        service_fee = 0
+        swap_input = 0
         system_out = 0
         ata_count = 0
         price = 0
@@ -1348,25 +1422,68 @@ class BotService:
             if program != COMPUTE_BUDGET_ID:
                 non_budget += 1
             if program in (PUMP_PROGRAM, PUMPSWAP_PROGRAM):
+                name = SWAP_NAMES.get(data[:8], "")
+                if saw_pump or len(data) < 24 or not name:
+                    raise ValueError("Unexpected swap direction or instruction")
+                if program == PUMPSWAP_PROGRAM:
+                    if name not in ("buy", "sell", "buy_exact_quote_in") or len(accts) < 13:
+                        raise ValueError("Unsupported PumpSwap layout")
+                    user, base, dest, token_program = accts[1], accts[3], accts[5], accts[11]
+                    direction = side.lower()
+                    quote_mint, quote_account = accts[4], accts[6]
+                    if accts[3] == WSOL and accts[4] == mint:
+                        base, dest, token_program = accts[4], accts[6], accts[12]
+                        quote_mint, quote_account = accts[3], accts[5]
+                        direction = "sell" if side == "BUY" else "buy"
+                    if not name.startswith(direction) or quote_mint != WSOL or quote_account != wrapped:
+                        raise ValueError("Unexpected PumpSwap quote account")
+                elif name.endswith("_v2"):
+                    if len(accts) < 16 or accts[2] != WSOL:
+                        raise ValueError("Unsupported curve quote")
+                    user, base, dest, token_program = accts[13], accts[1], accts[14], accts[3]
+                else:
+                    if name not in ("buy", "sell", "buy_exact_sol_in") or len(accts) < 10:
+                        raise ValueError("Unsupported curve instruction")
+                    user, base, dest = accts[6], accts[2], accts[5]
+                    token_program = accts[9 if side == "SELL" else 8]
+                if program == PUMP_PROGRAM and not name.startswith(side.lower()):
+                    raise ValueError("Unexpected curve swap direction")
+                if (user != wallet or base != mint or token_program not in (TOKEN_PROGRAM_ID, TOKEN_2022_ID)
+                        or dest != token_account(wallet, mint, token_program)):
+                    raise ValueError("Unexpected Pump wallet or mint")
+                first, second = struct.unpack_from("<QQ", data, 8)
+                maximum_input = second if name in ("buy", "buy_v2") else first
+                if min(first, second) == 0 or maximum_input > spend_lamports:
+                    raise ValueError("Swap exceeds input budget or lacks an output minimum")
+                swap_input = maximum_input
                 saw_pump = True
             elif program == SYSTEM_ID:
                 kind = int.from_bytes(data[:4], "little")
-                if kind in (0, 2):
+                if kind == 2 and accts == [wallet, wrapped] and side == "BUY":
                     if not accts or accts[0] != wallet or len(data) < 12:
                         raise ValueError("System instruction does not originate from wallet")
                     system_out += int.from_bytes(data[4:12], "little")
+                elif kind == 2 and len(data) == 12 and accts == [wallet, PUMPPORTAL_FEE_RECIPIENT]:
+                    service_fee += int.from_bytes(data[4:12], "little")
+                    if service_fee > fee_limit:
+                        raise ValueError("PumpPortal service fee exceeds budget")
                 else:
                     raise ValueError(f"Disallowed System instruction type {kind}")
             elif program in (TOKEN_PROGRAM_ID, TOKEN_2022_ID):
                 op = data[0] if data else -1
-                if op in (1, 16, 17, 18, 22):
+                if op == 17 and accts == [wrapped]:
                     pass
                 elif op == 9:
-                    if len(accts) < 2 or accts[1] != wallet:
+                    if accts != [wrapped, wallet, wallet]:
                         raise ValueError("Token close sends funds to a foreign account")
                 else:
                     raise ValueError(f"Disallowed token instruction {op}")
             elif program == ATA_PROGRAM_ID:
+                if (len(accts) < 6 or accts[0] != wallet or accts[2] != wallet
+                        or accts[3] not in (mint, WSOL) or accts[5] not in (TOKEN_PROGRAM_ID, TOKEN_2022_ID)
+                        or accts[1] != token_account(wallet, accts[3], accts[5])
+                        or data not in (b"", b"\x00", b"\x01")):
+                    raise ValueError("Unexpected associated account")
                 ata_count += 1
                 if ata_count > 4:
                     raise ValueError("Too many associated-token-account creations")
@@ -1384,15 +1501,15 @@ class BotService:
         if price * effective_limit // 1_000_000 > MAX_PRIORITY_LAMPORTS:
             raise ValueError("Builder priority fee is too high")
         if side == "BUY":
-            cap = int(spend_lamports * (10_000 + slip_bps) // 10_000) + PORTAL_RENT_ALLOWANCE
+            cap = spend_lamports
         else:
             cap = PORTAL_RENT_ALLOWANCE
-        if system_out > cap:
+        if system_out > cap or (side == "BUY" and max(swap_input, system_out) + service_fee > cap):
             raise ValueError("Builder transaction moves more SOL than allowed")
         return msg
 
-    def sign_portal_transaction(self, blob, key, side, mint, spend_lamports, slip_bps):
-        msg = self.validate_portal_tx(blob, key, side, mint, spend_lamports, slip_bps)
+    def sign_portal_transaction(self, blob, key, side, mint, spend_lamports, slip_bps, resolved=(), fee_limit=None):
+        msg = self.validate_portal_tx(blob, key, side, mint, spend_lamports, slip_bps, resolved, fee_limit)
         signed = VersionedTransaction(msg, [key])
         signature = signed.signatures[0]
         if not signature.verify(key.pubkey(), to_bytes_versioned(msg)):
@@ -1406,13 +1523,13 @@ class BotService:
                 "encoding": "base64",
                 "skipPreflight": False,
                 "preflightCommitment": "confirmed",
-                "maxRetries": 0,
+                "maxRetries": 3,
             },
         ])
 
     # ------------------------------------------------------------------ websocket
     async def websocket_monitor(self):
-        """Low-latency hint. Subscriptions are acknowledged; polling is the recovery path."""
+        """Dispatch confirmed signatures directly. Polling covers disconnects and queue overflow."""
         backoff = 1
         while True:
             try:
@@ -1482,9 +1599,13 @@ class BotService:
                                 params = payload.get("params") or {}
                                 addr = subs.get(params.get("subscription"))
                                 value = (params.get("result") or {}).get("value") or {}
-                                if addr and not value.get("err"):
-                                    self.hot_addresses.add(addr)
-                                    self.ws_signal.set()
+                                if addr and value.get("signature") and value.get("err") is None:
+                                    queue = self.alert_queues[hash(addr) % len(self.alert_queues)]
+                                    try:
+                                        queue.put_nowait((addr, value["signature"]))
+                                    except asyncio.QueueFull:
+                                        self.hot_addresses.add(addr)
+                                        self.ws_signal.set()
                         elif msg.type in (
                             aiohttp.WSMsgType.CLOSE,
                             aiohttp.WSMsgType.CLOSING,
@@ -1520,20 +1641,22 @@ class BotService:
         ) as response:
             data = await response.json(content_type=None)
             if response.status != 200:
+                if response.status in (401, 403):
+                    raise ValueError("Jupiter access denied. Check JUPITER_API_KEY on the server.")
                 if 400 <= response.status < 500 and response.status != 429:
                     raise ValueError("This token can't be traded right now")
                 raise RuntimeError(f"Jupiter order HTTP {response.status}")
             if not isinstance(data, dict) or not data.get("outAmount"):
                 raise ValueError("This token can't be traded right now")
+            if (data.get("inputMint") != source or data.get("outputMint") != destination
+                    or int(data.get("inAmount") or 0) != int(amount) or int(data["outAmount"]) <= 0):
+                raise ValueError("Jupiter quote does not match the requested swap")
             if wallet:
                 if not data.get("transaction") or not data.get("requestId"):
-                    raise ValueError("This token can't be traded right now")
-                if data.get("inputMint") and data["inputMint"] != source:
-                    raise ValueError("Trade didn't match what was expected, so it was skipped")
-                if data.get("outputMint") and data["outputMint"] != destination:
-                    raise ValueError("Trade didn't match what was expected, so it was skipped")
-                if data.get("inAmount") and int(data["inAmount"]) > int(amount):
-                    raise ValueError("Trade would cost more than planned, so it was skipped")
+                    reason = str(data.get("errorMessage") or "no executable route")[:120]
+                    raise ValueError(f"Jupiter {data.get('router', 'order')}: {reason}")
+                if data.get("taker") != wallet or not 0 <= int(data.get("slippageBps", -1)) <= slippage:
+                    raise ValueError("Unexpected Jupiter signer or slippage")
             return data
 
     async def sol_usd(self):
@@ -1567,7 +1690,7 @@ class BotService:
         signed_signature = str(signed.signatures[0])
         if signed.signatures[0] == Signature.default():
             raise ValueError("Trade was rejected for safety")
-        headers = {"x-api-key": JUP_KEY}
+        headers = {"x-api-key": JUP_KEY} if JUP_KEY else {}
         return signed_signature, base64.b64encode(bytes(signed)).decode(), headers
 
     async def submit_jupiter(self, order, signed_b64, headers):
@@ -1592,33 +1715,30 @@ class BotService:
 
         meta = tx["meta"]
         log_lines = meta.get("logMessages") or []
-        logs = " ".join(log_lines).lower()
-        programs = set()
-        for line in log_lines:
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] == "Program" and parts[2].startswith("invoke"):
-                programs.add(parts[1])
         msg = (tx.get("transaction") or {}).get("message") or {}
         keys = [
             k.get("pubkey") if isinstance(k, dict) else k
             for k in msg.get("accountKeys", [])
         ]
-        loaded = meta.get("loadedAddresses") or {}
-        all_keys = set(keys) | set(loaded.get("writable") or []) | set(loaded.get("readonly") or [])
-        programs |= {p for p in (PUMP_PROGRAM, PUMPSWAP_PROGRAM, JUP_PROGRAM) if p in all_keys}
+        if not any(isinstance(k, dict) and k.get("pubkey") == master and k.get("signer")
+                   for k in msg.get("accountKeys", [])):
+            return None, "Master did not sign"
+        # Match instruction logs to the invoking program, including CPI swaps.
+        stack = []
+        venues = set()
+        for line in log_lines:
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "Program" and parts[2] == "invoke":
+                stack.append(parts[1])
+            elif stack and line.startswith(f"Program {stack[-1]} success"):
+                stack.pop()
+            elif stack and line.startswith("Program log: Instruction: "):
+                name = line.split(": ")[-1].lower().replace("_", "")
+                if ((stack[-1] in (PUMP_PROGRAM, PUMPSWAP_PROGRAM) and name in
+                     ("buy", "sell", "buyv2", "sellv2", "buyexactsolin", "buyexactquotein", "buyexactquoteinv2"))
+                        or (stack[-1] == JUP_PROGRAM and "route" in name)):
+                    venues.add(stack[-1])
 
-        swap_words = (
-            "instruction: swap", "instruction: route", "instruction: buy",
-            "instruction: sell", "instruction: sharedaccountsroute",
-            "instruction: exactoutroute", "swapbasein", "swapbaseout",
-            "instruction: buyexactin", "instruction: sellall",
-            "instruction: buyexactout", "instruction: buyexactsolin",
-            "instruction: buy_exact_sol_in", "instruction: sell_exact_sol_out",
-        )
-        pump_present = bool(programs & {PUMP_PROGRAM, PUMPSWAP_PROGRAM})
-        if not pump_present and not any(word in logs for word in swap_words):
-            return None, "No recognized swap or buy/sell instruction"
-        venue = detect_venue(programs)
 
         def owner_balances(entries):
             result = {}
@@ -1644,10 +1764,71 @@ class BotService:
             if idx < len(pre_s) and idx < len(post_s):
                 fee = int(meta.get("fee") or 0) if keys and keys[0] == master else 0
                 sol_delta = int(post_s[idx]) - int(pre_s[idx]) + fee
-                if sol_delta < -1_000_000:
+                if sol_delta < 0:
                     quote_spent = True
-                if sol_delta > 1_000_000:
+                if sol_delta > 0:
                     quote_gained = True
+
+        # Bind the owner's changed token account to the swap itself. An unrelated
+        # transfer in the same signature must never select the copied mint.
+        instructions = list(msg.get("instructions") or [])
+        for group in meta.get("innerInstructions") or []:
+            instructions.extend(group.get("instructions") or [])
+        candidate = gained or lost
+        if len(candidate) != 1:
+            return None, "Multiple or missing target mints"
+        target = candidate[0][0]
+        side = "BUY" if gained else "SELL"
+        owned_accounts = set()
+        for field in ("preTokenBalances", "postTokenBalances"):
+            for entry in meta.get(field) or []:
+                idx = entry.get("accountIndex")
+                if (entry.get("owner") == master and entry.get("mint") == target
+                        and isinstance(idx, int) and 0 <= idx < len(keys)):
+                    owned_accounts.add(keys[idx])
+        bound = False
+        for ix in instructions:
+            program = ix.get("programId")
+            accts = ix.get("accounts") or []
+            if master not in accts:
+                continue
+            if program in DIRECT_SWAP_PROGRAMS and owned_accounts.intersection(accts):
+                raw = base58.b58decode(ix.get("data", ""))
+                if program == RAY_V4:
+                    matches = (len(raw) == 17 and raw[0] in (9, 11)
+                               and len(accts) >= 3 and accts[-1] == master
+                               and accts[-2 if side == "BUY" else -3] in owned_accounts)
+                else:
+                    matches = raw[:8] in DIRECT_SWAP_DISCRIMINATORS
+                if matches:
+                    venues.add(program)
+                    bound = True
+                continue
+            if program not in venues and program not in (PUMP_PROGRAM, PUMPSWAP_PROGRAM):
+                continue
+            if program == JUP_PROGRAM:
+                if owned_accounts.intersection(accts):
+                    bound = True
+                continue
+            data = base58.b58decode(ix.get("data", ""))
+            name = SWAP_NAMES.get(data[:8], "")
+            direction = side.lower()
+            if program == PUMPSWAP_PROGRAM:
+                user_i, mint_i, account_i = 1, 3, 5
+                if len(accts) > 6 and accts[4] == target and accts[3] in QUOTE_MINTS:
+                    direction = "sell" if side == "BUY" else "buy"
+                    mint_i, account_i = 4, 6
+            elif name.endswith("_v2"):
+                user_i, mint_i, account_i = 13, 1, 14
+            else:
+                user_i, mint_i, account_i = 6, 2, 5
+            if (name.startswith(direction) and len(accts) > max(user_i, mint_i, account_i) and accts[user_i] == master
+                    and accts[mint_i] == target and accts[account_i] in owned_accounts):
+                bound = True
+                venues.add(program)
+        venue = detect_venue(venues)
+        if not bound:
+            return None, "Target token account could not be tied to the swap instruction"
 
         if len(gained) == 1 and len(lost) == 0 and quote_spent:
             return ("BUY", gained[0][0], None, venue), ""
@@ -1668,12 +1849,12 @@ class BotService:
         )
 
     # ------------------------------------------------------------------ reconciliation
-    async def finalize_trade(self, tid, status, message):
+    async def finalize_trade(self, tid, status, message, signature):
         return await self.pool.fetchrow("""
             UPDATE copy_trades SET status=$2, message=$3
-            WHERE id=$1 AND status = ANY($4)
+            WHERE id=$1 AND status = ANY($4) AND signature=$5
             RETURNING user_id,side,mint,usd,signature,route
-        """, tid, status, message, UNRESOLVED)
+        """, tid, status, message, UNRESOLVED, signature)
 
     async def announce_trade(self, row, status):
         sig = row["signature"]
@@ -1688,6 +1869,8 @@ class BotService:
                 + (f"Via: {via}\n" if via else "")
                 + (f"<a href=\"{link}\">View</a>" if link else "")
             )
+        elif status == "EXPIRED":
+            text = f"Copy order expired without a transaction receipt. Token: <code>{row['mint']}</code>"
         else:
             text = (
                 f"❌ <b>The {row['side'].lower()} didn't go through</b>\n"
@@ -1696,36 +1879,69 @@ class BotService:
             )
         await self.notify(row["user_id"], text)
 
-    async def reconcile_one(self, tid, signature, signed_at=None):
+    async def reconcile_one(self, tid, signature, signed_at=None, blockhash=None):
         result = await self.rpc("getSignatureStatuses", [
             [signature], {"searchTransactionHistory": True},
         ])
         state = ((result or {}).get("value") or [None])[0]
-        if state and state.get("err") is not None:
+        if state and state.get("confirmationStatus") in ("confirmed", "finalized") and state.get("err") is not None:
             status, message = "FAILED", "On-chain transaction failed"
         elif state and state.get("confirmationStatus") in ("confirmed", "finalized"):
-            status, message = "CONFIRMED", None
-        elif (
-            state is None and signed_at is not None
-            and (datetime.now(timezone.utc) - signed_at).total_seconds() > SIGNATURE_EXPIRY_SECONDS
-        ):
-            status, message = "FAILED", "Never landed (blockhash expired)"
+            trade = await self.pool.fetchrow(
+                "SELECT wallet_address, side, mint FROM copy_trades WHERE id=$1", tid
+            )
+            tx = await self.get_transaction(signature)
+            meta = tx.get("meta") or {}
+            if meta.get("err") is not None or signature != tx["transaction"]["signatures"][0]:
+                return "UNKNOWN"
+            owner = trade["wallet_address"]
+            if owner is None:
+                signers = [k["pubkey"] for k in tx["transaction"]["message"]["accountKeys"] if k.get("signer")]
+                if len(signers) != 1:
+                    return "UNKNOWN"
+                owner = signers[0]
+
+            def total(field):
+                return sum(int(item["uiTokenAmount"]["amount"]) for item in meta[field]
+                           if item.get("owner") == owner and item["mint"] == trade["mint"])
+            delta = total("postTokenBalances") - total("preTokenBalances")
+            if delta * (1 if trade["side"] == "BUY" else -1) <= 0:
+                changed = await self.pool.fetchval("""
+                    UPDATE copy_trades SET status='UNKNOWN', message='Confirmed signature, unexpected mint delta'
+                    WHERE id=$1 AND status IN ('SIGNED','SUBMITTED') RETURNING user_id
+                """, tid)
+                if changed is not None:
+                    await self.pause_user(changed, "On-chain token movement needs review. Check History.", unresolved=True)
+                return "UNKNOWN"
+            status, message = "CONFIRMED", f"Verified token delta (raw units): {delta}"
+        elif (state is None and result and result.get("value") == [None] and blockhash and signed_at
+              and (datetime.now(timezone.utc) - signed_at).total_seconds() >= 180):
+            validity = await self.rpc("isBlockhashValid", [blockhash, {"commitment": "finalized"}])
+            if validity.get("value") is not False:
+                return "UNKNOWN"
+            receipt = await self.rpc("getTransaction", [signature, {
+                "encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 1,
+            }])
+            if receipt is not None:
+                return "UNKNOWN"
+            status, message = "EXPIRED", "Blockhash expired. RPC returned no finalized receipt."
         else:
             return "UNKNOWN"
-        row = await self.finalize_trade(tid, status, message)
+        row = await self.finalize_trade(tid, status, message, signature)
         if row:
+            self.trade_wake.set()
             await self.announce_trade(row, status)
         return status
 
     async def reconcile_all(self):
         rows = await self.pool.fetch("""
-            SELECT id,signature,signed_at FROM copy_trades
+            SELECT id,signature,signed_at,recent_blockhash FROM copy_trades
             WHERE status = ANY($1) AND signature IS NOT NULL
             ORDER BY id LIMIT 100
         """, UNRESOLVED)
         for row in rows:
             try:
-                await self.reconcile_one(row["id"], row["signature"], row["signed_at"])
+                await self.reconcile_one(row["id"], row["signature"], row["signed_at"], row["recent_blockhash"])
             except Exception as exc:
                 LOG.warning("Reconciliation failed trade=%s: %s", row["id"], type(exc).__name__)
         wrows = await self.pool.fetch("""
@@ -1740,14 +1956,8 @@ class BotService:
                 ])
                 state = ((result or {}).get("value") or [None])[0]
                 new = None
-                if state and state.get("err") is not None:
-                    new = "FAILED"
-                elif state and state.get("confirmationStatus") in ("confirmed", "finalized"):
-                    new = "CONFIRMED"
-                elif state is None and (
-                    datetime.now(timezone.utc) - row["created_at"]
-                ).total_seconds() > SIGNATURE_EXPIRY_SECONDS:
-                    new = "FAILED"
+                if state and state.get("confirmationStatus") in ("confirmed", "finalized"):
+                    new = "FAILED" if state.get("err") is not None else "CONFIRMED"
                 if new:
                     await self.pool.execute(
                         "UPDATE copy_withdrawals SET status=$2 WHERE id=$1", row["id"], new
@@ -1780,8 +1990,14 @@ class BotService:
                 rows = await self.pool.fetch("""
                     UPDATE copy_trades SET status='QUOTING'
                     WHERE id IN (
-                        SELECT id FROM copy_trades WHERE status='QUEUED'
-                        ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED
+                        SELECT q.id FROM copy_trades q WHERE q.status='QUEUED'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM copy_trades earlier
+                              WHERE earlier.user_id=q.user_id AND earlier.id<>q.id
+                                AND (earlier.status IN ('SIGNED','SUBMITTED','UNKNOWN','SUBMITTING','QUOTING')
+                                     OR (earlier.status='QUEUED' AND earlier.id<q.id))
+                          )
+                        ORDER BY q.id LIMIT 10 FOR UPDATE SKIP LOCKED
                     )
                     RETURNING id,user_id,master_address,master_signature,side,mint,
                               fraction,block_time,venue,created_at
@@ -1802,6 +2018,7 @@ class BotService:
 
     def _trade_done(self, task):
         self.inflight.discard(task)
+        self.trade_wake.set()
         try:
             task.result()
         except asyncio.CancelledError:
@@ -1822,7 +2039,7 @@ class BotService:
         self.notice_throttle[uid] = now
         await self.notify(uid, f"⚠️ A trade was skipped: {html.escape(reason)}")
 
-    async def execute_copy(self, row):
+    async def execute_copy(self, row, *, jupiter_only=False):
         tid = row["id"]
         uid = row["user_id"]
         side = row["side"]
@@ -1856,34 +2073,25 @@ class BotService:
                     raise ValueError("Auto trading was paused or the wallet changed")
                 if time.time() - observed > int(current["max_signal_age_seconds"]):
                     raise ValueError("The master's trade was too old by the time it was ready")
-                if await self.has_unresolved(uid, ["UNKNOWN"]):
+                if await self.has_unresolved(uid):
                     raise ValueError("An earlier trade is still being checked")
 
                 phase = "SIZING"
+                sizing_cap = current["max_usd"]
                 decimals = None
                 if side == "BUY":
-                    lamports = int((await self.rpc("getBalance", [wallet]))["value"])
-                    available_sol = max(0, lamports - MIN_SOL_RESERVE)
-                    price = await self.sol_usd()
+                    balance, price = await asyncio.gather(self.rpc("getBalance", [wallet]), self.sol_usd())
+                    available_sol = max(0, int(balance["value"]) - MIN_SOL_RESERVE)
                     usd_limit = Decimal(current["max_usd"])
                     max_lamports = int(
                         (usd_limit / price * Decimal(10**9)).to_integral_value(rounding=ROUND_DOWN)
                     )
-                    if available_sol >= 1_000_000 and max_lamports >= 1_000_000:
+                    if available_sol > 0 and max_lamports > 0:
                         source, dest = WSOL, mint
                         raw = min(available_sol, max_lamports)
                         usd = min(usd_limit, Decimal(raw) / Decimal(10**9) * price)
-                        if usd < Decimal("0.50"):
+                        if raw < max_lamports and usd < Decimal("0.50"):
                             raise ValueError("Not enough SOL: trade would be under $0.50")
-                    elif current["allow_usdc_fallback"]:
-                        available_usdc, _ = await self.token_balance(wallet, USDC)
-                        if available_usdc < 500_000:
-                            raise ValueError("Not enough SOL or USDC to copy this trade")
-                        source, dest = USDC, mint
-                        raw = min(available_usdc, int(usd_limit * 1_000_000))
-                        usd = Decimal(raw) / Decimal(1_000_000)
-                        if usd < Decimal("0.50"):
-                            raise ValueError("Not enough USDC: trade would be under $0.50")
                     else:
                         raise ValueError(
                             "Not enough SOL to copy this trade. Add SOL to your wallet."
@@ -1892,24 +2100,27 @@ class BotService:
                     if fraction is None or not (Decimal(0) < Decimal(fraction) <= Decimal(1)):
                         raise ValueError("Couldn't work out how much to sell")
                     fraction = Decimal(fraction)
-                    had_buy = await self.pool.fetchval("""
-                        SELECT EXISTS(SELECT 1 FROM copy_trades
-                        WHERE user_id=$1 AND side='BUY' AND mint=$2
-                          AND status NOT IN ('SKIPPED','FAILED'))
-                    """, uid, mint)
-                    if not had_buy:
-                        raise ValueError("You didn't copy a buy of this token, so no sell")
-                    owned, decimals = 0, None
-                    for _ in range(12):  # wait up to ~10s for a pending buy to land
-                        owned, decimals = await self.token_balance(wallet, mint)
-                        if owned > 0:
-                            break
-                        await asyncio.sleep(0.8)
+                    owned, decimals = await self.token_balance(wallet, mint)
                     raw = int(Decimal(owned) * fraction)
                     if raw <= 0:
                         raise ValueError("No tokens available to sell")
+                    # Value sells conservatively using an exact-input quote.
+                    if row["venue"] == "pumpfun":
+                        try:
+                            sell_lamports = Decimal(raw) * await self.curve_spot(mint)
+                        except ValueError:
+                            sell_lamports = Decimal((await self.jupiter_order(mint, WSOL, raw))["outAmount"])
+                    else:
+                        sell_lamports = Decimal((await self.jupiter_order(mint, WSOL, raw))["outAmount"])
+                    value = sell_lamports * await self.sol_usd() / Decimal(10**9)
+                    if value <= 0:
+                        raise ValueError("Cannot value sell")
+                    if value > current["max_usd"]:
+                        raw = int(Decimal(raw) * current["max_usd"] / value)
+                    if raw <= 0:
+                        raise ValueError("Sell is below one token unit")
                     source, dest = mint, WSOL
-                    usd = Decimal(0)
+                    usd = min(value, current["max_usd"])
 
                 await self.pool.execute(
                     "UPDATE copy_trades SET usd=$2 WHERE id=$1", tid, usd
@@ -1934,26 +2145,26 @@ class BotService:
                 signed_b64 = None
                 pump_venue = row["venue"] in ("pumpfun", "pumpswap")
 
-                if current["use_pumpportal"] and pump_venue and (side == "SELL" or source == WSOL):
+                if pump_venue and not jupiter_only:
                     try:
                         if side == "BUY":
-                            amount_arg = Decimal(raw) / Decimal(10**9)
+                            nominal = raw * 10000 // (10000 + slip + PUMPPORTAL_FEE_BPS)
+                            fee_limit = (nominal * PUMPPORTAL_FEE_BPS + 9999) // 10000
+                            amount_arg = Decimal(nominal) / Decimal(10**9)
                             spend = raw
                         else:
-                            spend = 0
-                            if fraction >= Decimal("0.999"):
-                                amount_arg = "100%"
-                            else:
-                                amount_arg = Decimal(raw) / Decimal(10**decimals)
+                            spend = raw
+                            fee_limit = int(sell_lamports * PUMPPORTAL_FEE_BPS / 10000 * usd / value) + 1
+                            amount_arg = Decimal(raw) / Decimal(10**decimals)
                         blob = await self.portal_transaction(wallet, mint, side, amount_arg, slip)
                         signed_sig, signed_b64 = self.sign_portal_transaction(
-                            blob, key, side, mint, spend, slip
+                            blob, key, side, mint, spend, slip, await self.lookup_keys(blob), fee_limit
                         )
                         route = "pumpportal"
-                    except (ValueError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    except (ValueError, IndexError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
                         LOG.warning(
                             "PumpPortal route rejected trade_id=%s (%s: %s); trying Jupiter",
-                            tid, type(exc).__name__, str(exc)[:160]
+                            tid, type(exc).__name__, str(exc).split("?")[0][:160]
                         )
 
                 if route is None:
@@ -1967,13 +2178,24 @@ class BotService:
                         except Exception:
                             usd = Decimal(0)
 
+                current = await self.user(uid)
+                if (not current["enabled"] or current["address"] != wallet
+                        or current["max_usd"] < sizing_cap or current["slip_bps"] < slip
+                        or not current["copy_buys" if side == "BUY" else "copy_sells"]
+                        or time.time() - observed > current["max_signal_age_seconds"]
+                        or not await self.pool.fetchval(
+                            "SELECT EXISTS(SELECT 1 FROM copy_masters WHERE user_id=$1 AND address=$2 AND active)",
+                            uid, row["master_address"])):
+                    raise ValueError("Copy settings changed or signal expired")
+                signed_tx = VersionedTransaction.from_bytes(base64.b64decode(signed_b64))
+                blockhash = str(signed_tx.message.recent_blockhash)
                 # Save the transaction ID BEFORE sending it.
                 await self.pool.execute("""
                     UPDATE copy_trades
                     SET signature=$2,status='SIGNED',signed_at=now(),message=NULL,
-                        route=$3,usd=$4
+                        route=$3,usd=$4,wallet_address=$5,recent_blockhash=$6
                     WHERE id=$1
-                """, tid, signed_sig, route, usd)
+                """, tid, signed_sig, route, usd, wallet, blockhash)
                 phase = "SUBMITTING"
 
                 if route == "pumpportal":
@@ -2012,6 +2234,17 @@ class BotService:
             else:
                 LOG.info("Trade %s submitted; awaiting confirmation via reconciler", tid)
 
+        except PreflightRejected as exc:
+            # This was the only submission of this signature. An explicit RPC
+            # simulation rejection is distinct from a timeout after transmission.
+            reset = await self.pool.fetchval("""
+                UPDATE copy_trades SET status='QUOTING',signature=NULL,signed_at=NULL,
+                    message=$3 WHERE id=$1 AND signature=$2 AND status='SIGNED'
+                RETURNING id
+            """, tid, signed_sig, f"Pump preflight rejected: {exc}")
+            if reset is not None:
+                LOG.info("Pump preflight rejected trade=%s error=%s; requesting Jupiter route", tid, exc)
+                await self.execute_copy(row, jupiter_only=True)
         except Exception as exc:
             if phase == "SUBMITTING" and signed_sig:
                 await self.pool.execute("""
@@ -2055,7 +2288,7 @@ class BotService:
                 {
                     "encoding": "jsonParsed",
                     "commitment": "confirmed",
-                    "maxSupportedTransactionVersion": 0,
+                    "maxSupportedTransactionVersion": 1,
                 },
             ])
             if tx is not None:
@@ -2074,73 +2307,79 @@ class BotService:
         previous = await self.pool.fetchval(
             "SELECT signature FROM copy_cursors WHERE address=$1", address
         )
-        if previous is None:
-            entries = await self.rpc("getSignaturesForAddress", [
-                address, {"limit": 1, "commitment": "confirmed"}
-            ])
-            if entries:
-                await self.pool.execute("""
-                    INSERT INTO copy_cursors(address,signature)
-                    VALUES($1,$2) ON CONFLICT DO NOTHING
-                """, address, entries[0]["signature"])
-            return 0
-
-        entries = await self.rpc("getSignaturesForAddress", [
-            address, {"limit": 100, "until": previous, "commitment": "confirmed"}
-        ])
+        options = {"limit": 100, "commitment": "confirmed"}
+        if previous:
+            options["until"] = previous
+        entries = await self.rpc("getSignaturesForAddress", [address, options])
         if not entries:
             return 0
-        if len(entries) >= 100:
-            LOG.warning(
-                "Possible history gap for %s; replaying window (duplicates are blocked by DB)",
-                shortened(address)
-            )
+        page = list(entries)
+        while len(page) == 100 and (page[-1].get("blockTime") or 0) >= time.time() - max_age:
+            options["before"] = page[-1]["signature"]
+            page = await self.rpc("getSignaturesForAddress", [address, options])
+            if page and page[-1]["signature"] == options["before"]:
+                raise RuntimeError("RPC history pagination did not advance")
+            entries.extend(page)
         newest = entries[0]["signature"]
 
-        for item in reversed(entries):  # oldest first
-            if item.get("err"):
+        for item in reversed(entries):
+            if item.get("err") or item.get("blockTime") is None:
                 continue
-            signature = item["signature"]
-            block_time = item.get("blockTime") or int(time.time())
-            age = time.time() - block_time
-            if not 0 <= age <= max_age:
-                continue
-            tx = await self.get_transaction(signature)
-            swap, reason = self.classify_swap(tx, address)
-            if not swap:
-                LOG.info("Ignored tx %s: %s", shortened(signature), reason)
-                continue
-            side, mint, fraction, venue = swap
-            followers = await self.pool.fetch("""
-                SELECT m.user_id, u.enabled_since
-                FROM copy_masters m
-                JOIN copy_users u ON u.id=m.user_id
-                WHERE m.address=$1 AND m.active AND u.enabled
-            """, address)
-            for follower in followers:
-                since = follower["enabled_since"]
-                if since is not None and block_time < since.timestamp():
-                    continue
-                inserted = await self.pool.fetchrow("""
-                    INSERT INTO copy_trades
-                    (user_id,master_address,master_signature,side,mint,status,
-                     block_time,fraction,venue)
-                    VALUES($1,$2,$3,$4,$5,'QUEUED',$6,$7,$8)
-                    ON CONFLICT DO NOTHING RETURNING id
-                """, follower["user_id"], address, signature, side, mint,
-                    int(block_time), fraction, venue)
-                if inserted:
-                    LOG.info(
-                        "Queued %s uid=%s mint=%s venue=%s",
-                        side, follower["user_id"], shortened(mint), venue
-                    )
-                    self.trade_wake.set()
+            if -5 <= time.time() - item["blockTime"] <= max_age:
+                signature = item["signature"]
+                tx = await self.get_transaction(signature)
+                await self.enqueue_signal(address, signature, tx, item["blockTime"])
 
         await self.pool.execute("""
             INSERT INTO copy_cursors(address,signature) VALUES($1,$2)
             ON CONFLICT(address) DO UPDATE SET signature=EXCLUDED.signature
         """, address, newest)
         return len(entries)
+
+    async def alert_worker(self, queue):
+        while True:
+            address, signature = await queue.get()
+            try:
+                tx = await self.get_transaction(signature)
+                if tx.get("blockTime") is not None:
+                    await self.enqueue_signal(address, signature, tx, tx["blockTime"])
+            except Exception as exc:
+                LOG.warning("Alert deferred to polling master=%s signature=%s error=%s",
+                            address, signature, type(exc).__name__)
+            finally:
+                queue.task_done()
+
+    async def enqueue_signal(self, address, signature, tx, block_time):
+        swap, reason = self.classify_swap(tx, address)
+        if not swap:
+            LOG.info("Ignored master=%s signature=%s reason=%s", address, signature, reason)
+            return
+        side, mint, fraction, venue = swap
+        followers = await self.pool.fetch("""
+            SELECT m.user_id, GREATEST(u.enabled_since,m.active_since) AS enabled_since, u.max_signal_age_seconds
+            FROM copy_masters m
+            JOIN copy_users u ON u.id=m.user_id
+            WHERE m.address=$1 AND m.active AND u.enabled
+        """, address)
+        for follower in followers:
+            since = follower["enabled_since"]
+            if (since is None or block_time < int(since.timestamp())
+                    or time.time() - block_time > follower["max_signal_age_seconds"]):
+                continue
+            inserted = await self.pool.fetchrow("""
+                INSERT INTO copy_trades
+                (user_id,master_address,master_signature,side,mint,status,
+                 block_time,fraction,venue)
+                VALUES($1,$2,$3,$4,$5,'QUEUED',$6,$7,$8)
+                ON CONFLICT DO NOTHING RETURNING id
+            """, follower["user_id"], address, signature, side, mint,
+                int(block_time), fraction, venue)
+            if inserted:
+                LOG.info(
+                    "Queued %s uid=%s mint=%s venue=%s master_sig=%s",
+                    side, follower["user_id"], mint, venue, signature
+                )
+                self.trade_wake.set()
 
     async def poll_one(self, master, next_poll, burst):
         address = master["address"]
@@ -2203,7 +2442,41 @@ class BotService:
                 pass
 
 
+async def inspect_master_trade(address, signature):
+    if not valid_address(address):
+        raise SystemExit("Enter a valid master wallet address")
+    try:
+        Signature.from_string(signature)
+    except ValueError:
+        raise SystemExit("Enter a valid transaction signature") from None
+    service = BotService()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20), trust_env=True) as session:
+        service.session = session
+        result = await service.rpc("getTransaction", [signature, {
+            "encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1,
+        }], endpoint=RPC or "https://api.mainnet-beta.solana.com")
+    swap, reason = service.classify_swap(result, address)
+    if swap:
+        side, mint, fraction, venue = swap
+        print(f"{side} mint={mint} venue={venue} master_fraction={fraction}")
+    else:
+        print(f"Skipped: {reason}")
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == "--inspect-trade":
+        asyncio.run(inspect_master_trade(*sys.argv[2:]))
+        return
+    if len(sys.argv) == 3 and sys.argv[1] == "--seal-wallet":
+        seal_wallet(sys.argv[2])
+        return
+    if not TOKEN or not DSN or not RPC:
+        raise SystemExit("Set TELEGRAM_TOKEN, DATABASE_URL and HELIUS_RPC_URL")
+    parsed_rpc = urlsplit(RPC)
+    if (parsed_rpc.scheme != "https" or
+            parsed_rpc.hostname != "mainnet.helius-rpc.com" or
+            not parse_qs(parsed_rpc.query).get("api-key", [""])[0]):
+        raise SystemExit("HELIUS_RPC_URL must be a valid Helius mainnet HTTPS RPC URL")
     service = BotService()
     app = (
         Application.builder()
@@ -2212,6 +2485,10 @@ def main():
         .post_shutdown(service.shutdown)
         .build()
     )
+    async def on_error(update, ctx):
+        LOG.error("Telegram handler failed: %s", type(ctx.error).__name__)
+
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler(["start", "menu"], service.start))
     for command, page in (
         ("wallet", "wallet"),
