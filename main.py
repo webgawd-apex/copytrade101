@@ -4,6 +4,8 @@ import base64
 import html
 import json
 import logging
+import random
+import re
 import os
 import secrets
 import struct
@@ -312,11 +314,17 @@ class BotService:
         self.worker_task = None
         self.reconcile_task = None
         self.rpc_limit = asyncio.Semaphore(4)
+        # Shared pacing/cooldown across ALL HTTP RPC users (monitoring + execution).
+        self.rpc_pace_lock = asyncio.Lock()
+        self.rpc_next_at = 0.0
+        self.rpc_cooldown_until = 0.0
+        self.rpc_spacing_seconds = 0.30  # conservative starting point: <= ~3.3 req/s
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
         self.hot_addresses = set()
         self.poll_locks = {}
+        self.poll_cooldowns = {}
         self.wallet_locks = {}
         self.price_cache = (0.0, None)
         self.inflight = set()
@@ -402,20 +410,54 @@ class BotService:
 
     # ------------------------------------------------------------------ rpc + data
     async def rpc(self, method, params):
-        async with self.rpc_limit:
-            async with self.session.post(RPC, json={
-                "jsonrpc": "2.0", "id": 1,
-                "method": method, "params": params
-            }) as response:
-                if response.status != 200:
-                    raise RuntimeError(f"Helius RPC {method} returned HTTP {response.status}")
-                data = await response.json()
-                if data.get("error"):
-                    error = data["error"]
-                    raise RuntimeError(
-                        f"Helius RPC {method} failed (code {error.get('code', 'unknown')})"
-                    )
-                return data.get("result")
+        """Globally paced Helius RPC; bounded retries and shared 429 cooldown.
+
+        No automatic retries for sendTransaction: an uncertain broadcast must be
+        reconciled by its signature, not retransmitted as a new attempt.
+        """
+        attempts = 1 if method == "sendTransaction" else 4
+        for attempt in range(attempts):
+            async with self.rpc_pace_lock:
+                now = time.monotonic()
+                ready = max(self.rpc_next_at, self.rpc_cooldown_until)
+                if ready > now:
+                    await asyncio.sleep(ready - now)
+                self.rpc_next_at = time.monotonic() + self.rpc_spacing_seconds
+            try:
+                async with self.rpc_limit:
+                    async with self.session.post(RPC, json={
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": method, "params": params,
+                    }) as response:
+                        if response.status == 429:
+                            retry_after = response.headers.get("Retry-After")
+                            try:
+                                delay = max(1.0, min(120.0, float(retry_after)))
+                            except (TypeError, ValueError):
+                                delay = min(60.0, 3.0 * (2 ** attempt))
+                            delay += random.uniform(0.0, 0.5)
+                            async with self.rpc_pace_lock:
+                                self.rpc_cooldown_until = max(
+                                    self.rpc_cooldown_until, time.monotonic() + delay
+                                )
+                            LOG.warning("Helius throttled method=%s cooldown=%.1fs", method, delay)
+                            if method == "sendTransaction":
+                                raise RuntimeError("Helius sendTransaction HTTP 429 (broadcast uncertain)")
+                            continue
+                        if response.status != 200:
+                            raise RuntimeError(f"Helius RPC {method} returned HTTP {response.status}")
+                        data = await response.json()
+                        if data.get("error"):
+                            error = data["error"]
+                            raise RuntimeError(
+                                f"Helius RPC {method} failed (code {error.get('code', 'unknown')})"
+                            )
+                        return data.get("result")
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if method == "sendTransaction" or attempt + 1 == attempts:
+                    raise
+                await asyncio.sleep(min(4.0, 0.5 * 2 ** attempt))
+        raise RuntimeError(f"Helius RPC {method} remains rate limited after retries")
 
     def wallet_lock(self, address):
         return self.wallet_locks.setdefault(address, asyncio.Lock())
@@ -1656,6 +1698,24 @@ class BotService:
         if len(gained) == 1 and len(lost) == 0 and quote_spent:
             return ("BUY", gained[0][0], None, venue), ""
 
+        # Some Pump.fun purchases are funded by temporary/inner SOL accounts;
+        # master wallet's net SOL change can look like zero. Do not treat a
+        # token receipt alone as a buy: require a successful Pump invocation,
+        # explicit Pump BUY instruction log, AND master as transaction signer.
+        parsed_keys = msg.get("accountKeys") or []
+        master_signed = any(
+            isinstance(k, dict) and k.get("pubkey") == master and k.get("signer") is True
+            for k in parsed_keys
+        )
+        pump_buy_log = any(re.search(
+            r"instruction:\s*(?:buy|buyexactin|buyexactout|buyexactsolin|buy_exact_sol_in)\b",
+            line, re.IGNORECASE
+        ) for line in log_lines)
+        if (len(gained) == 1 and not lost and pump_present and
+                pump_buy_log and master_signed):
+            LOG.info("Pump buy inferred from verified instruction, mint=%s", shortened(gained[0][0]))
+            return ("BUY", gained[0][0], None, venue), ""
+
         if len(lost) == 1 and len(gained) == 0 and quote_gained:
             available_before = before.get(lost[0][0], 0)
             fraction = (
@@ -1869,6 +1929,7 @@ class BotService:
                 if await self.has_unresolved(uid, ["UNKNOWN"]):
                     raise ValueError("An earlier trade is still being checked")
 
+                LOG.info("Copy preparing trade_id=%s uid=%s side=%s venue=%s", tid, uid, side, row["venue"])
                 phase = "SIZING"
                 decimals = None
                 if side == "BUY":
@@ -1967,6 +2028,7 @@ class BotService:
                         )
 
                 if route is None:
+                    LOG.info("Copy quoting trade_id=%s via=jupiter mint=%s", tid, shortened(mint))
                     order = await self.jupiter_order(source, dest, raw, wallet, slip)
                     signed_sig, signed_b64, headers = await self.jupiter_execute(order, key)
                     route = "jupiter"
@@ -1985,6 +2047,7 @@ class BotService:
                     WHERE id=$1
                 """, tid, signed_sig, route, usd)
                 phase = "SUBMITTING"
+                LOG.info("Copy signed trade_id=%s route=%s sig=%s", tid, route, shortened(signed_sig))
 
                 if route == "pumpportal":
                     result_sig = await self.submit_portal(signed_b64)
@@ -2007,6 +2070,7 @@ class BotService:
                     "UPDATE copy_trades SET status='SUBMITTED' WHERE id=$1 AND status='SIGNED'", tid
                 )
                 phase = "RECONCILING"
+                LOG.info("Copy submitted trade_id=%s route=%s", tid, route)
 
             # Lock released; confirm on-chain (background checker continues if still pending).
             chain = "UNKNOWN"
@@ -2051,7 +2115,8 @@ class BotService:
                     UPDATE copy_trades SET status='FAILED',message=$2
                     WHERE id=$1 AND status IN ('QUEUED','QUOTING')
                 """, tid, "Couldn't complete this trade")
-                LOG.error("Copy trade failed id=%s phase=%s exc=%s", tid, phase, type(exc).__name__)
+                LOG.error("Copy trade failed id=%s phase=%s exc=%s detail=%s",
+                          tid, phase, type(exc).__name__, str(exc)[:160])
                 await self.notify(
                     uid,
                     f"❌ <b>Couldn't copy a {side.lower()}.</b> "
@@ -2174,16 +2239,20 @@ class BotService:
 
     async def poll_one(self, master, next_poll, burst):
         address = master["address"]
-        next_poll[address] = time.monotonic() + float(master["interval"])
+        # WS hints provide immediacy; don't hammer HTTP for every master.
+        next_poll[address] = time.monotonic() + max(3.0, float(master["interval"]))
         try:
             found = await self.poll_master(address, int(master["max_age"]))
             if burst.get(address, 0) > 0:
                 if found == 0:
                     burst[address] -= 1
-                    next_poll[address] = time.monotonic() + 0.3
+                    next_poll[address] = time.monotonic() + 3.0
                 else:
                     burst[address] = 0
         except Exception as exc:
+            # Back off this master, too, so notifications cannot restart a hot loop.
+            self.poll_cooldowns[address] = time.monotonic() + 15.0
+            next_poll[address] = max(next_poll[address], self.poll_cooldowns[address])
             LOG.error(
                 "Wallet monitoring error wallet=%s type=%s detail=%s",
                 shortened(address), type(exc).__name__,
@@ -2214,14 +2283,21 @@ class BotService:
                         if address not in active:
                             next_poll.pop(address, None)
                             burst.pop(address, None)
+                            self.poll_cooldowns.pop(address, None)
                 hot = set(self.hot_addresses)
                 self.hot_addresses.clear()
                 for address in hot:
-                    next_poll[address] = 0
-                    burst[address] = 3
+                    # Respect the shared Helius backoff even during WS bursts.
+                    if (time.monotonic() >= self.rpc_cooldown_until and
+                            time.monotonic() >= self.poll_cooldowns.get(address, 0)):
+                        next_poll[address] = min(next_poll.get(address, 0), now)
+                        burst[address] = 1
                 due = [m for m in masters if now >= next_poll.get(m["address"], 0)]
                 if due:
-                    await asyncio.gather(*(self.poll_one(m, next_poll, burst) for m in due))
+                    # Global RPC pacing handles concurrency, but serial polling
+                    # prevents large bursts of queued signature-page requests.
+                    for master in due:
+                        await self.poll_one(master, next_poll, burst)
             except asyncio.CancelledError:
                 raise
             except Exception:
