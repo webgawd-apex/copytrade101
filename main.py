@@ -359,6 +359,7 @@ class BotService:
         self.worker_task = None
         self.reconcile_task = None
         self.take_profit_task = None
+        self.tp_cursor = 0
         self.rpc_limit = asyncio.Semaphore(4)
         # Shared pacing/cooldown across ALL HTTP RPC users (monitoring + execution).
         self.rpc_pace_lock = asyncio.Lock()
@@ -1989,7 +1990,7 @@ class BotService:
             else:
                 await self.pool.execute('''
                     UPDATE copy_positions SET status='REVIEW'
-                    WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL')
+                    WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL','SELLING')
                 ''',trade['user_id'],trade['mint'])
 
     async def reconcile_one(self, tid, signature, signed_at=None):
@@ -2035,7 +2036,7 @@ class BotService:
                 if traded and traded['side'] == 'SELL' and traded['tp_position_id'] is None:
                     await self.pool.execute("""
                         UPDATE copy_positions SET status='REVIEW'
-                        WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL')
+                        WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL','SELLING')
                     """, traded['user_id'],traded['mint'])
             elif status == 'FAILED':
                 await self.pool.execute("UPDATE copy_positions SET status='REVIEW' WHERE id=(SELECT tp_position_id FROM copy_trades WHERE id=$1) AND status='SELLING'",tid)
@@ -2143,9 +2144,13 @@ class BotService:
                     SELECT p.*,u.slip_bps FROM copy_positions p
                     JOIN copy_users u ON u.id=p.user_id
                     WHERE p.status='OPEN' AND u.enabled AND u.take_profit_enabled
-                    ORDER BY p.id LIMIT 20
-                """)
+                      AND p.id > $1
+                    ORDER BY p.id LIMIT 4
+                """, self.tp_cursor)
+                if not rows:
+                    self.tp_cursor = 0
                 for p in rows:
+                    self.tp_cursor = p['id']
                     try:
                         await self.check_take_profit(p)
                     except asyncio.CancelledError:
@@ -2157,7 +2162,7 @@ class BotService:
                 raise
             except Exception:
                 LOG.exception('Take-profit monitor error')
-            await asyncio.sleep(8)
+            await asyncio.sleep(10)
 
     async def check_take_profit(self, p):
         uid, mint, wallet = p['user_id'],p['mint'],p['wallet']
@@ -2326,19 +2331,19 @@ class BotService:
                         raw = min(available_sol, max_lamports)
                         usd = min(usd_limit, Decimal(raw) / Decimal(10**9) * price)
                         if usd < Decimal("0.50"):
-                            raise ValueError("Not enough SOL")
+                            raise ValueError("Not enough SOL: trade would be under $0.50")
                     elif current["allow_usdc_fallback"]:
                         available_usdc, _ = await self.token_balance(wallet, USDC)
                         if available_usdc < 500_000:
-                            raise ValueError("Not enough SOL or USDC")
+                            raise ValueError("Not enough SOL or USDC to copy this trade")
                         source, dest = USDC, mint
                         raw = min(available_usdc, int(usd_limit * 1_000_000))
                         usd = Decimal(raw) / Decimal(1_000_000)
                         if usd < Decimal("0.50"):
-                            raise ValueError("Not enough USDC")
+                            raise ValueError("Not enough USDC: trade would be under $0.50")
                     else:
                         raise ValueError(
-                            "Not enough SOL"
+                            "Not enough SOL to copy this trade. Add SOL to your wallet."
                         )
                 else:
                     if fraction is None or not (Decimal(0) < Decimal(fraction) <= Decimal(1)):
@@ -2504,7 +2509,7 @@ class BotService:
                     WHERE id=$1 AND status IN ('QUEUED','QUOTING')
                 """, tid, reason)
                 if row['tp_position_id'] is not None:
-                    new_state = 'OPEN' if reason == 'Profit target not met' else 'REVIEW'
+                    new_state = 'OPEN' if (signed_sig is None and reason == 'Profit target not met') else 'REVIEW'
                     await self.pool.execute("UPDATE copy_positions SET status=$2 WHERE id=$1 AND status='SELLING'",row['tp_position_id'],new_state)
                     # Unique per-attempt identifiers preserve historical skips and allow a later retry.
                 LOG.info("Copy skipped trade_id=%s phase=%s reason=%s", tid, phase, reason)
@@ -2575,6 +2580,12 @@ class BotService:
                 found_cursor = True  # 'until' may legitimately yield no new entries
                 break
             entries.extend(batch)
+            # Older than the allowable copy window: no need to reach a stale cursor.
+            # A missing blockTime is not evidence that a transaction is old.
+            oldest = batch[-1].get("blockTime")
+            if oldest is not None and int(oldest) < int(time.time()) - int(max_age) - 5:
+                found_cursor = True
+                break
             # The 'until' boundary is exclusive. A short page means we reached
             # that boundary (or the end of available history).
             if len(batch) < 100:
