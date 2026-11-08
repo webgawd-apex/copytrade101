@@ -399,8 +399,8 @@ class BotService:
             self.awaiting_resolution.add(row["id"])
             await self.notify(
                 row["id"],
-                "🛑 <b>Auto trading paused</b>\nA trade was still being checked when the "
-                "bot restarted. I'll message you as soon as it's sorted out."
+                "🛑 <b>Auto trading paused</b>\n"
+                ""
             )
         self.monitor_task = asyncio.create_task(self.monitor())
         self.ws_task = asyncio.create_task(self.websocket_monitor())
@@ -651,7 +651,7 @@ class BotService:
         """, uid)
         if unresolved:
             self.awaiting_resolution.add(uid)
-        await self.notify(uid, f"🛑 <b>Auto trading paused</b>\n{html.escape(reason)}")
+        await self.notify(uid, f"🛑 <b>Auto trading is stopped Joshua says hi</b>\n{html.escape(reason)}")
 
     # ------------------------------------------------------------------ transfers
     async def confirm_signature(self, signature, timeout):
@@ -1017,8 +1017,8 @@ class BotService:
             f"Trade {trade_id} archived as expired/unconfirmed. No order was resent."
         )
         await self.notify(changed['user_id'],
-            '✅ A previous unconfirmed transaction was reviewed. '
-            'Check your holdings and history before turning Auto Trade back on.')
+            '✅ Just reviewed a transaction. '
+            'Check holdings and history first before turning Auto Trade back on.')
 
     async def emergency_pause(self, uid):
         await self.pool.execute("UPDATE copy_users SET enabled=FALSE WHERE id=$1", uid)
@@ -1879,7 +1879,7 @@ class BotService:
         await self.notify(row["user_id"], text)
 
     async def record_confirmed_position(self, tid):
-        """Idempotent, only count owner-held tokens actually received on-chain."""
+        """Idempotent."""
         trade = await self.pool.fetchrow("SELECT * FROM copy_trades WHERE id=$1", tid)
         if not trade or not trade['signature']:
             return
@@ -1990,8 +1990,8 @@ class BotService:
                 if changed:
                     LOG.warning('Trade requires independent review trade_id=%s',tid)
                     await self.notify(changed,
-                        '⚠️ <b>A transaction needs operator review.</b> Auto Trade is paused to prevent duplicates. '
-                        'Please contact the bot operator with your most recent trade ID.')
+                        '⚠️ <b>transaction needs review.</b> Auto Trade is paused, Joshua says hi. '
+                        '')
                 return 'REVIEW_REQUIRED'
             return "UNKNOWN"
         row = await self.finalize_trade(tid, status, message)
@@ -2100,8 +2100,8 @@ class BotService:
                         self.awaiting_resolution.discard(uid)
                         await self.notify(
                             uid,
-                            "✅ Everything is sorted out now. Have a look at your wallet, "
-                            "then turn Auto Trade back on when you're ready."
+                            ""
+                            ""
                         )
             except asyncio.CancelledError:
                 raise
@@ -2245,7 +2245,7 @@ class BotService:
         if now - self.notice_throttle.get(uid, 0) < 600:
             return
         self.notice_throttle[uid] = now
-        await self.notify(uid, f"⚠️ A trade was skipped: {html.escape(reason)}")
+        await self.notify(uid, f"⚠️ trade was skipped: {html.escape(reason)}")
 
     async def execute_copy(self, row):
         tid = row["id"]
@@ -2495,7 +2495,7 @@ class BotService:
                 await self.notify(
                     uid,
                     f"❌ <b>Couldn't copy a {side.lower()}.</b> "
-                    "Check your wallet and trade history before retrying."
+                    ""
                 )
 
     # ------------------------------------------------------------------ monitoring
