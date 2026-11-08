@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS copy_positions (
  cost_usd NUMERIC(20,8) NOT NULL,
  status TEXT NOT NULL DEFAULT 'OPEN',
  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
- CHECK(token_amount > 0),
+ CHECK(token_amount >= 0),
  CHECK(decimals BETWEEN 0 AND 18)
 );
 CREATE INDEX IF NOT EXISTS copy_positions_open_idx ON copy_positions(status,user_id);
@@ -214,6 +214,22 @@ MIGRATIONS = (
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS take_profit_since TIMESTAMPTZ",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS tp_position_id BIGINT",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS tp_raw_amount NUMERIC(38,0)",
+    # An existing v2 table may still have CHECK(token_amount > 0), which
+    # rejects a successful 100% close. Relax it exactly once if necessary.
+    """DO $$ BEGIN
+       IF EXISTS (
+           SELECT 1 FROM pg_constraint
+           WHERE conrelid='copy_positions'::regclass
+             AND conname='copy_positions_token_amount_check'
+             AND pg_get_constraintdef(oid) LIKE '%> 0%'
+       ) THEN
+           ALTER TABLE copy_positions
+             DROP CONSTRAINT copy_positions_token_amount_check;
+           ALTER TABLE copy_positions
+             ADD CONSTRAINT copy_positions_token_amount_check
+             CHECK (token_amount >= 0);
+       END IF;
+    END $$""",
 )
 
 
@@ -399,8 +415,7 @@ class BotService:
             self.awaiting_resolution.add(row["id"])
             await self.notify(
                 row["id"],
-                "🛑 <b>Auto trading paused</b>\n"
-                ""
+                "<b>Auto Trade paused</b>\n"
             )
         self.monitor_task = asyncio.create_task(self.monitor())
         self.ws_task = asyncio.create_task(self.websocket_monitor())
@@ -651,7 +666,7 @@ class BotService:
         """, uid)
         if unresolved:
             self.awaiting_resolution.add(uid)
-        await self.notify(uid, f"🛑 <b>Auto trading is stopped Joshua says hi</b>\n{html.escape(reason)}")
+        await self.notify(uid, f"<b>Auto Trade paused</b>\n{html.escape(reason)}")
 
     # ------------------------------------------------------------------ transfers
     async def confirm_signature(self, signature, timeout):
@@ -693,7 +708,7 @@ class BotService:
             if u["enabled"] and u["address"] == w["address"]:
                 raise ValueError("Pause auto trading before sending funds.")
             if await self.has_unresolved(uid):
-                raise ValueError("A previous transaction has an uncertain outcome. Auto Trade remains paused until it is verified; check Trade History or contact the bot operator.")
+                raise ValueError("A recent transaction needs verification before trading can resume.")
             sender = Pubkey.from_string(w["address"])
             dest = Pubkey.from_string(recipient)
             key = Keypair.from_bytes(
@@ -774,8 +789,7 @@ class BotService:
                 except Exception:
                     balances = "\nBalances aren't available right now."
             text = (
-                "🤖 <b>Copy Trader bot</b>\n\n"
-                "🔴 <b>LIVE</b>\n\n"
+                "<b>Copy Trader</b>\nLive trading\n\n"
                 f"Auto Trade: <b>{state}</b>\n"
                 f"Master Wallets: <b>{len(ms)} / 3</b>\n"
                 f"Max Trade: <b>${u['max_usd']:.2f}</b>\n"
@@ -783,13 +797,13 @@ class BotService:
                 f"Active Wallet: <code>{address}</code>{balances}"
             )
             rows = [
-                [("⏸ Pause Auto Trade" if u["enabled"] else "Enable Auto Trade", "toggle")],
+                [("Pause Auto Trade" if u["enabled"] else "Enable Auto Trade", "toggle")],
             ]
             if u["enabled"]:
-                rows.append([("Stop bot", "estop")])
+                rows.append([("Stop Trading", "estop")])
             rows += [
-                [("👀 Master Wallets", "masters"), ("My Wallets", "wallet")],
-                [("⚙️ Settings", "settings"), ("History", "history")],
+                [("Master Wallets", "masters"), ("My Wallets", "wallet")],
+                [("Settings", "settings"), ("Trade History", "history")],
             ]
             if u["address"]:
                 rows.append([("📋 Copy Address", "copy", u["address"])])
@@ -807,13 +821,13 @@ class BotService:
                     f"<b>{html.escape(w['name'])}</b>\n"
                     f"<code>{w['address']}</code>"
                 )
-                rows.append([(f"👛 {w['name']}", f"walletview:{w['id']}")])
+                rows.append([(f" {w['name']}", f"walletview:{w['id']}")])
                 rows.append([("📋 Copy Address", "copy", w["address"])])
             if not ws:
                 lines.append("\nNo wallets yet.")
             rows += [
-                [("Generate", "generate"), ("Import", "import")],
-                [("Home", "home")],
+                [("➕ Generate", "generate"), ("📥 Import", "import")],
+                [(" Home", "home")],
             ]
             return "\n".join(lines), keyboard(rows)
 
@@ -840,7 +854,7 @@ class BotService:
                 [("🔑 Private Key", f"key:{wid}")],
             ]
             if not is_active:
-                rows.append([("✅ Set Active", f"active:{wid}")])
+                rows.append([("Set Active", f"active:{wid}")])
             rows += [
                 [("🗑 Delete Wallet", f"del:{wid}")],
                 [("👛 All Wallets", "wallet")],
@@ -860,11 +874,11 @@ class BotService:
                 rows.append([("📋 Copy Address", "copy", m["address"])])
                 rows.append([
                     ("⏯ Pause/Resume", f"mastertoggle:{m['id']}"),
-                    ("🗑 Remove", f"masterdelete:{m['id']}")
+                    (" Remove", f"masterdelete:{m['id']}")
                 ])
                 rows.append([
-                    ("✏️ Rename", f"masterrename:{m['id']}"),
-                    ("🔁 Change Address", f"masterreplace:{m['id']}")
+                    (" Rename", f"masterrename:{m['id']}"),
+                    (" Change Address", f"masterreplace:{m['id']}")
                 ])
             if not ms:
                 lines.append("\nNo master wallets yet.")
@@ -888,19 +902,19 @@ class BotService:
                 f"(+{u['take_profit_pct']}%, sell {u['take_profit_sell_pct']}% of entry)"
             )
             return text, keyboard([
-                [("💵 Max Trade", "edit:max"),
-                 ("📉 Slippage", "edit:slip")],
-                [("🔁 Buys", "setting:buy"),
+                [(" Max Trade", "edit:max"),
+                 (" Slippage", "edit:slip")],
+                [(" Buys", "setting:buy"),
                  ("🔁 Sells", "setting:sell")],
-                [("⏱ Check speed", "edit:poll"),
-                 ("⌛ Trade age", "edit:age")],
-                [("💱 Use USDC if no SOL", "setting:usdc")],
+                [(" speed check", "edit:poll"),
+                 (" Trade age", "edit:age")],
+                [(" Use USDC", "setting:usdc")],
                 [("🚀 Pump.fun fast mode", "setting:pump")],
-                [("📈 Auto take profit ON/OFF", "setting:tp")],
-                [("🎯 Profit %", "edit:tp")],
-                [("💰 Token sell %", "edit:tp_sell")],
-                [("🛑 Stop Now", "estop")],
-                [("🏠 Home", "home")],
+                [("Take Profit On/Off", "setting:tp")],
+                [("Profit %", "edit:tp")],
+                [("Amount to Sell %", "edit:tp_sell")],
+                [("Stop Trading", "estop")],
+                [("Home", "home")],
             ])
 
         if page == "history":
@@ -908,7 +922,7 @@ class BotService:
                 SELECT * FROM copy_trades WHERE user_id=$1
                 ORDER BY id DESC LIMIT 6
             """, uid)
-            lines = ["📜 <b>Recent Trades</b>"]
+            lines = [" <b>Recent Trades</b>"]
             rows = []
             for t in trades:
                 stamp = t["created_at"].strftime("%m-%d %H:%M UTC")
@@ -928,11 +942,11 @@ class BotService:
                 if t["signature"]:
                     rows.append([
                         ("📋 Copy ID", "copy", t["signature"]),
-                        ("🔎 View", f"url:https://solscan.io/tx/{t['signature']}"),
+                        (" View", f"url:https://solscan.io/tx/{t['signature']}"),
                     ])
             if not trades:
                 lines.append("No trades yet.")
-            rows.append([("🏠 Home", "home")])
+            rows.append([("Home", "home")])
             return "\n".join(lines), keyboard(rows)
 
         return await self.screen(uid, "home")
@@ -1017,8 +1031,7 @@ class BotService:
             f"Trade {trade_id} archived as expired/unconfirmed. No order was resent."
         )
         await self.notify(changed['user_id'],
-            '✅ Just reviewed a transaction. '
-            'Check holdings and history first before turning Auto Trade back on.')
+            'Transaction reviewed. Check holding.')
 
     async def emergency_pause(self, uid):
         await self.pool.execute("UPDATE copy_users SET enabled=FALSE WHERE id=$1", uid)
@@ -1061,9 +1074,9 @@ class BotService:
         if data == "import":
             ctx.user_data["pending"] = ("import",)
             return await q.edit_message_text(
-                "📥 Send your wallet's private key here.\n"
-                "I'll delete your message right after.\n"
-                "Send /cancel to go back."
+                "Send the wallet private key to import it.\n"
+                "The message will be deleted after processing.\n"
+                "Use /cancel to stop."
             )
 
         if data.startswith("walletview:"):
@@ -1204,7 +1217,7 @@ class BotService:
             if await self.has_unresolved(uid):
                 return await self.show(
                     update, "history",
-                    "A trade is still being checked. Try again in a minute."
+                    "A recent transaction needs verification before trading can resume."
                 )
             if not u["encrypted_secret"] or not await self.masters(uid):
                 return await self.show(
@@ -1865,21 +1878,21 @@ class BotService:
             usd = f" (about ${row['usd']:.2f})" if row["usd"] else ""
             via = VIA_WORDS.get(row["route"] or "")
             text = (
-                f"✅ <b>{verb}</b>{usd}\n"
+                f"<b>{verb}</b>{usd}\n"
                 f"Token: <code>{row['mint']}</code>\n"
                 + (f"Via: {via}\n" if via else "")
                 + (f"<a href=\"{link}\">View</a>" if link else "")
             )
         else:
             text = (
-                f"❌ <b>The {row['side'].lower()} didn't go through</b>\n"
+                f"<b>{row['side'].title()} failed</b>\n"
                 f"Token: <code>{row['mint']}</code>\n"
                 + (f"<a href=\"{link}\">View</a>" if link else "")
             )
         await self.notify(row["user_id"], text)
 
     async def record_confirmed_position(self, tid):
-        """Idempotent."""
+        """Idempotent,."""
         trade = await self.pool.fetchrow("SELECT * FROM copy_trades WHERE id=$1", tid)
         if not trade or not trade['signature']:
             return
@@ -1893,13 +1906,22 @@ class BotService:
             u = await self.user(trade['user_id'])
             if not u['take_profit_enabled'] or not u['take_profit_since'] or trade['created_at'] < u['take_profit_since']:
                 return
-            wallet = u['address']
-            # A wallet switch since the trade would make attribution unsafe.
+            # Use the actual transaction signer, not the currently selected wallet.
+            # A user can switch wallets after a buy has already confirmed.
             msg = tx.get('transaction', {}).get('message', {})
-            keys = [x.get('pubkey') if isinstance(x, dict) else x
-                    for x in msg.get('accountKeys', [])]
-            if wallet not in keys:
-                LOG.warning('Position skipped: wallet not found trade_id=%s', tid)
+            account_keys = msg.get('accountKeys') or []
+            first = account_keys[0] if account_keys else None
+            wallet = first.get('pubkey') if isinstance(first, dict) else first
+            if not wallet or not valid_address(wallet):
+                LOG.warning('Position skipped: invalid transaction signer trade_id=%s', tid)
+                return
+            # Never register a position unless it belongs to this user's wallet.
+            is_owned_wallet = await self.pool.fetchval('''
+                SELECT EXISTS(SELECT 1 FROM copy_wallets
+                              WHERE user_id=$1 AND address=$2)
+            ''', trade['user_id'], wallet)
+            if not is_owned_wallet:
+                LOG.warning('Position skipped: signer not owned by user trade_id=%s', tid)
                 return
             def owned(entries):
                 value = 0
@@ -1961,7 +1983,7 @@ class BotService:
             else:
                 await self.pool.execute('''
                     UPDATE copy_positions SET status='REVIEW'
-                    WHERE user_id=$1 AND mint=$2 AND status='OPEN'
+                    WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL')
                 ''',trade['user_id'],trade['mint'])
 
     async def reconcile_one(self, tid, signature, signed_at=None):
@@ -1990,8 +2012,7 @@ class BotService:
                 if changed:
                     LOG.warning('Trade requires independent review trade_id=%s',tid)
                     await self.notify(changed,
-                        '⚠️ <b>transaction needs review.</b> Auto Trade is paused, Joshua says hi. '
-                        '')
+                        '<b>pending review</b>\nAuto Trade is paused')
                 return 'REVIEW_REQUIRED'
             return "UNKNOWN"
         row = await self.finalize_trade(tid, status, message)
@@ -2008,7 +2029,7 @@ class BotService:
                 if traded and traded['side'] == 'SELL' and traded['tp_position_id'] is None:
                     await self.pool.execute("""
                         UPDATE copy_positions SET status='REVIEW'
-                        WHERE user_id=$1 AND mint=$2 AND status='OPEN'
+                        WHERE user_id=$1 AND mint=$2 AND status IN ('OPEN','PARTIAL')
                     """, traded['user_id'],traded['mint'])
             elif status == 'FAILED':
                 await self.pool.execute("UPDATE copy_positions SET status='REVIEW' WHERE id=(SELECT tp_position_id FROM copy_trades WHERE id=$1) AND status='SELLING'",tid)
@@ -2100,8 +2121,7 @@ class BotService:
                         self.awaiting_resolution.discard(uid)
                         await self.notify(
                             uid,
-                            ""
-                            ""
+                            "check complete."
                         )
             except asyncio.CancelledError:
                 raise
@@ -2245,7 +2265,7 @@ class BotService:
         if now - self.notice_throttle.get(uid, 0) < 600:
             return
         self.notice_throttle[uid] = now
-        await self.notify(uid, f"⚠️ trade was skipped: {html.escape(reason)}")
+        await self.notify(uid, f"⚠️trade skipped: {html.escape(reason)}")
 
     async def execute_copy(self, row):
         tid = row["id"]
@@ -2393,7 +2413,9 @@ class BotService:
                     LOG.info("Copy quoting trade_id=%s via=jupiter mint=%s", tid, shortened(mint))
                     order = await self.jupiter_order(source, dest, raw, wallet, slip)
                     if row['tp_position_id'] is not None:
-                        lot = await self.pool.fetchrow('SELECT cost_usd FROM copy_positions WHERE id=$1',row['tp_position_id'])
+                        lot = await self.pool.fetchrow('SELECT cost_usd, token_amount FROM copy_positions WHERE id=$1',row['tp_position_id'])
+                        if not lot or int(lot['token_amount']) <= 0:
+                            raise ValueError('Take-profit position is unavailable')
                         sol_price = await self.sol_usd()
                         expected_net = (Decimal(str(order['outAmount'])) / Decimal(10**9) - Decimal('0.003')) * sol_price
                         floor = Decimal(lot['cost_usd']) * Decimal(raw) / Decimal(lot['token_amount']) * (Decimal(1) + Decimal(current['take_profit_pct'])/100)
@@ -2464,9 +2486,7 @@ class BotService:
                 LOG.error("Submission uncertain trade_id=%s exc=%s", tid, type(exc).__name__)
                 await self.pause_user(
                     uid,
-                    "I wasn't sure whether a trade went through, so I stopped to be safe. "
-                    "I'm checking it now and I won't send it again. "
-                    "I'll message you when it's sorted out.",
+                    "Trade confirmation is pending. Auto Trade has been paused.",
                     unresolved=True,
                 )
             elif phase == "RECONCILING":
@@ -2494,8 +2514,7 @@ class BotService:
                           tid, phase, type(exc).__name__, str(exc)[:160])
                 await self.notify(
                     uid,
-                    f"❌ <b>Couldn't copy a {side.lower()}.</b> "
-                    ""
+                    f"<b>{side.title()} failed.</b>."
                 )
 
     # ------------------------------------------------------------------ monitoring
@@ -2614,7 +2633,7 @@ class BotService:
 
     async def poll_one(self, master, next_poll, burst):
         address = master["address"]
-        # WS hints provide immediacy.
+        # WS hints provide immediacy; don't hammer HTTP for every master.
         next_poll[address] = time.monotonic() + max(3.0, float(master["interval"]))
         try:
             found = await self.poll_master(address, int(master["max_age"]))
@@ -2625,7 +2644,7 @@ class BotService:
                 else:
                     burst[address] = 0
         except Exception as exc:
-            # Back off this master josua.
+            # Back off this master, too, so notifications cannot restart a hot loop.
             self.poll_cooldowns[address] = time.monotonic() + 15.0
             next_poll[address] = max(next_poll[address], self.poll_cooldowns[address])
             LOG.error(
@@ -2662,15 +2681,15 @@ class BotService:
                 hot = set(self.hot_addresses)
                 self.hot_addresses.clear()
                 for address in hot:
-                    # For respect the shared Helius backoff even during WS bursts.
+                    # Respect the shared Helius backoff even during WS bursts.
                     if (time.monotonic() >= self.rpc_cooldown_until and
                             time.monotonic() >= self.poll_cooldowns.get(address, 0)):
                         next_poll[address] = min(next_poll.get(address, 0), now)
                         burst[address] = 1
                 due = [m for m in masters if now >= next_poll.get(m["address"], 0)]
                 if due:
-                    # Global RPC pacing handles concurrency, but polling
-                    # prevents large bursts of queued signature requests.
+                    # Global RPC pacing handles concurrency, but serial polling
+                    # prevents large bursts of queued signature-page requests.
                     for master in due:
                         await self.poll_one(master, next_poll, burst)
             except asyncio.CancelledError:
@@ -2720,17 +2739,17 @@ def main():
         if update.effective_chat.type != "private":
             return
         await update.message.reply_text(
-            "🤖 Copytradebot commands\n\n"
+            "Copy Trader commands\n\n"
             "/start or /menu — Dashboard\n"
             "/wallet — Manage wallets\n"
             "/send — Send SOL or USDC\n"
             "/masters — Manage master wallets\n"
-            "/settings — set trading preferences\n"
+            "/settings — Trading preferences\n"
             "/history — Recent trades\n"
             "/pause — Stop new trades\n"
             "/cancel — Cancel your current action\n"
-            "/help — Bot guide",
-            reply_markup=keyboard([[('🏠Dashboard', 'home')]]),
+            "/help — Show this guide",
+            reply_markup=keyboard([[('🏠 Open Dashboard', 'home')]]),
         )
 
     app.add_handler(CommandHandler("wallet", show_wallets))
