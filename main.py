@@ -117,7 +117,11 @@ CREATE TABLE IF NOT EXISTS copy_users (
  take_profit_enabled BOOLEAN NOT NULL DEFAULT FALSE,
  take_profit_pct NUMERIC(8,2) NOT NULL DEFAULT 40 CHECK(take_profit_pct BETWEEN 1 AND 500),
  take_profit_sell_pct NUMERIC(5,2) NOT NULL DEFAULT 100 CHECK(take_profit_sell_pct BETWEEN 1 AND 100),
- take_profit_since TIMESTAMPTZ
+ take_profit_since TIMESTAMPTZ,
+ prevent_repeat_buys BOOLEAN NOT NULL DEFAULT FALSE,
+ stop_loss_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+ stop_loss_pct NUMERIC(8,2) NOT NULL DEFAULT 30 CHECK(stop_loss_pct BETWEEN 1 AND 99),
+ stop_loss_since TIMESTAMPTZ
 );
 CREATE TABLE IF NOT EXISTS copy_masters (
  id BIGSERIAL PRIMARY KEY,
@@ -150,6 +154,7 @@ CREATE TABLE IF NOT EXISTS copy_trades (
  signed_at TIMESTAMPTZ,
  tp_position_id BIGINT,
  tp_raw_amount NUMERIC(38,0),
+ auto_exit_kind TEXT,
  UNIQUE(user_id,master_address,master_signature)
 );
 CREATE TABLE IF NOT EXISTS copy_positions (
@@ -214,6 +219,11 @@ MIGRATIONS = (
     "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS take_profit_since TIMESTAMPTZ",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS tp_position_id BIGINT",
     "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS tp_raw_amount NUMERIC(38,0)",
+    "ALTER TABLE copy_trades ADD COLUMN IF NOT EXISTS auto_exit_kind TEXT",
+    "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS prevent_repeat_buys BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS stop_loss_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+    "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS stop_loss_pct NUMERIC(8,2) NOT NULL DEFAULT 30",
+    "ALTER TABLE copy_users ADD COLUMN IF NOT EXISTS stop_loss_since TIMESTAMPTZ",
     # An existing v2 table may still have CHECK(token_amount > 0), which
     # rejects a successful 100% close. Relax it exactly once if necessary.
     """DO $$ BEGIN
@@ -910,7 +920,9 @@ class BotService:
                 f"Use USDC if no SOL: {'ON' if u['allow_usdc_fallback'] else 'OFF'}\n"
                 f"Pump.fun fast mode: {'ON' if u['use_pumpportal'] else 'OFF'}\n"
                 f"Take profit: {'ON' if u['take_profit_enabled'] else 'OFF'} "
-                f"(+{u['take_profit_pct']}%, sell {u['take_profit_sell_pct']}% of entry)"
+                f"(+{u['take_profit_pct']}%, sell {u['take_profit_sell_pct']}%)\n"
+                f"Stop loss: {'ON' if u['stop_loss_enabled'] else 'OFF'} (-{u['stop_loss_pct']}%)\n"
+                f"Repeat buys blocked: {'ON' if u['prevent_repeat_buys'] else 'OFF'}"
             )
             return text, keyboard([
                 [("💵 Max Trade", "edit:max"),
@@ -924,6 +936,8 @@ class BotService:
                 [("Take Profit On/Off", "setting:tp")],
                 [("Profit Target %", "edit:tp")],
                 [("Amount to Sell %", "edit:tp_sell")],
+                [("Stop Loss On/Off", "setting:sl"), ("Loss Limit %", "edit:sl")],
+                [("Block Repeat Buys", "setting:repeat")],
                 [("Stop Trading", "estop")],
                 [("🏠 Home", "home")],
             ])
@@ -1242,12 +1256,20 @@ class BotService:
                 "usdc": "allow_usdc_fallback",
                 "pump": "use_pumpportal",
                 "tp": "take_profit_enabled",
+                "sl": "stop_loss_enabled",
+                "repeat": "prevent_repeat_buys",
             }.get(data.split(":")[1])
             if column:
                 if column == 'take_profit_enabled':
                     await self.pool.execute("""
                         UPDATE copy_users SET take_profit_enabled=NOT take_profit_enabled,
-                        take_profit_since=CASE WHEN take_profit_enabled THEN take_profit_since ELSE now() END
+                        take_profit_since=COALESCE(take_profit_since,now())
+                        WHERE id=$1
+                    """,uid)
+                elif column == 'stop_loss_enabled':
+                    await self.pool.execute("""
+                        UPDATE copy_users SET stop_loss_enabled=NOT stop_loss_enabled,
+                        stop_loss_since=COALESCE(stop_loss_since,now())
                         WHERE id=$1
                     """,uid)
                 else:
@@ -1266,6 +1288,7 @@ class BotService:
                 "age": "Maximum trade age (seconds):",
                 "tp": "Take-profit target (%):",
                 "tp_sell": "Amount to sell (%):",
+                "sl": "Stop loss (%):",
             }
             return await q.edit_message_text(prompts.get(mode, "Unknown setting"))
 
@@ -1418,7 +1441,7 @@ class BotService:
                 ctx.user_data.pop("pending", None)
                 return await self.show(update, "masters", "Master renamed.")
 
-            if pending in ("max", "slip", "poll", "age", "tp", "tp_sell"):
+            if pending in ("max", "slip", "poll", "age", "tp", "tp_sell", "sl"):
                 n = amount_number(value)
                 if pending == "tp_sell":
                     if not Decimal("1") <= n <= Decimal("100"):
@@ -1432,6 +1455,13 @@ class BotService:
                         raise ValueError("Target: 1–500%")
                     await self.pool.execute(
                         "UPDATE copy_users SET take_profit_pct=$2 WHERE id=$1",
+                        uid, n.quantize(Decimal("0.01"))
+                    )
+                elif pending == "sl":
+                    if not Decimal("1") <= n <= Decimal("99"):
+                        raise ValueError("Loss: 1–99%")
+                    await self.pool.execute(
+                        "UPDATE copy_users SET stop_loss_pct=$2 WHERE id=$1",
                         uid, n.quantize(Decimal("0.01"))
                     )
                 elif pending == "poll":
@@ -1874,7 +1904,7 @@ class BotService:
         return await self.pool.fetchrow("""
             UPDATE copy_trades SET status=$2, message=$3
             WHERE id=$1 AND status = ANY($4)
-            RETURNING user_id,side,mint,usd,signature,route
+            RETURNING user_id,side,mint,usd,signature,route,auto_exit_kind
         """, tid, status, message, UNRESOLVED)
 
     async def announce_trade(self, row, status):
@@ -1882,6 +1912,9 @@ class BotService:
         link = f"https://solscan.io/tx/{sig}" if sig else ""
         if status == "CONFIRMED":
             verb = "Bought" if row["side"] == "BUY" else "Sold"
+            if row["side"] == "SELL":
+                verb = {"SL": "Stop loss sold", "TP": "Take profit sold"}.get(
+                    row["auto_exit_kind"], verb)
             usd = f" (about ${row['usd']:.2f})" if row["usd"] else ""
             via = VIA_WORDS.get(row["route"] or "")
             text = (
@@ -1911,7 +1944,11 @@ class BotService:
             return
         if trade['side'] == 'BUY':
             u = await self.user(trade['user_id'])
-            if not u['take_profit_enabled'] or not u['take_profit_since'] or trade['created_at'] < u['take_profit_since']:
+            # Only manage positions opened after a risk feature was enabled.
+            # Persist the first activation time so toggling a feature doesn't
+            # lose the cost basis of a previously tracked position.
+            since = [t for t in (u['take_profit_since'], u['stop_loss_since']) if t is not None]
+            if not since or trade['created_at'] < min(since):
                 return
             # Use the actual transaction signer, not the currently selected wallet.
             # A user can switch wallets after a buy has already confirmed.
@@ -2101,7 +2138,11 @@ class BotService:
                     SELECT t.id FROM copy_trades t JOIN copy_users u ON u.id=t.user_id
                     LEFT JOIN copy_positions p ON p.trade_id=t.id
                     WHERE t.status='CONFIRMED' AND t.side='BUY' AND p.id IS NULL
-                      AND u.take_profit_enabled AND t.created_at >= u.take_profit_since AND t.created_at > now()-interval '1 hour'
+                      AND (u.take_profit_since IS NOT NULL OR u.stop_loss_since IS NOT NULL)
+                      AND t.created_at >= LEAST(
+                          COALESCE(u.take_profit_since, 'infinity'::timestamptz),
+                          COALESCE(u.stop_loss_since, 'infinity'::timestamptz))
+                      AND t.created_at > now()-interval '1 hour'
                     ORDER BY t.id DESC LIMIT 10
                 """)
                 for entry in recent:
@@ -2143,7 +2184,8 @@ class BotService:
                 rows = await self.pool.fetch("""
                     SELECT p.*,u.slip_bps FROM copy_positions p
                     JOIN copy_users u ON u.id=p.user_id
-                    WHERE p.status='OPEN' AND u.enabled AND u.take_profit_enabled
+                    WHERE p.status IN ('OPEN','PARTIAL') AND u.enabled
+                      AND (u.take_profit_enabled OR u.stop_loss_enabled)
                       AND p.id > $1
                     ORDER BY p.id LIMIT 4
                 """, self.tp_cursor)
@@ -2165,59 +2207,106 @@ class BotService:
             await asyncio.sleep(10)
 
     async def check_take_profit(self, p):
-        uid, mint, wallet = p['user_id'],p['mint'],p['wallet']
+        """Monitor both exits using executable quotes, with a single sell claim.
+
+        All amounts remain raw token units; cost_usd belongs to the remaining lot.
+        No automatic sell is inferred from a quote that cannot be obtained.
+        """
+        uid, mint, wallet = p['user_id'], p['mint'], p['wallet']
         u = await self.user(uid)
-        if not u['enabled'] or not u['take_profit_enabled'] or u['address'] != wallet:
+        if (not u['enabled'] or u['address'] != wallet or
+                not (u['take_profit_enabled'] or u['stop_loss_enabled'])):
             return
         if await self.has_unresolved(uid):
             return
-        competing_sell = await self.pool.fetchval("""
+        if await self.pool.fetchval("""
             SELECT EXISTS(SELECT 1 FROM copy_trades
                           WHERE user_id=$1 AND mint=$2 AND side='SELL'
-                            AND status IN ('QUEUED','QUOTING','SIGNED','SUBMITTED','UNKNOWN','SUBMITTING','REVIEW_REQUIRED'))
-        """,uid,mint)
-        if competing_sell:
+                            AND status IN ('QUEUED','QUOTING','SIGNED','SUBMITTED',
+                                           'UNKNOWN','SUBMITTING','REVIEW_REQUIRED'))
+        """, uid, mint):
             return
-        # An executable Jupiter sell quote is required. If a token is still
-        # exclusive to Pump.fun and cannot be quoted, do NOT estimate PnL.
-        current_raw, dec = await self.token_balance(wallet,mint)
-        if dec != p['decimals'] or current_raw <= 0:
+        current_raw, dec = await self.token_balance(wallet, mint)
+        held = int(p['token_amount'])
+        if held <= 0 or dec != p['decimals'] or current_raw < held:
+            await self.pool.execute("""
+                UPDATE copy_positions SET status='REVIEW'
+                WHERE id=$1 AND status IN ('OPEN','PARTIAL')
+            """, p['id'])
             return
-        raw = int(Decimal(int(p['token_amount'])) * Decimal(u['take_profit_sell_pct']) / Decimal(100))
-        if int(current_raw) < int(p['token_amount']) or raw < 1:
-            # External transfers/master sells broke lot attribution.
-            await self.pool.execute("UPDATE copy_positions SET status='REVIEW' WHERE id=$1 AND status='OPEN'",p['id'])
+        if Decimal(p['cost_usd']) <= 0:
             return
-        quote = await self.jupiter_order(mint,WSOL,raw,wallet, int(u['slip_bps']))
-        sol = Decimal(str(quote['outAmount'])) / Decimal(10**9)
-        price = await self.sol_usd()
-        # Conservative fixed buffer for network fee, priority fee and rent.
-        expected_net = (sol - Decimal('0.003')) * price
-        threshold = (Decimal(p['cost_usd']) * Decimal(raw) / Decimal(p['token_amount']) * (Decimal(1)+Decimal(u['take_profit_pct'])/100))
-        if expected_net < threshold:
+
+        # Stop loss always targets 100% of the remaining lot. Check it first.
+        # An accurate exit proceeds quote must exist before we create a sell.
+        choice = None
+        if u['stop_loss_enabled']:
+            full_quote = await self.jupiter_order(mint, WSOL, held, wallet, int(u['slip_bps']))
+            sol_price = await self.sol_usd()
+            net = max(Decimal(0), Decimal(str(full_quote['outAmount'])) / Decimal(10**9)
+                      - Decimal('0.003')) * sol_price
+            floor = Decimal(p['cost_usd']) * (Decimal(1) - Decimal(u['stop_loss_pct']) / 100)
+            if net <= floor:
+                choice = ('SL', held, floor, net)
+        if choice is None and u['take_profit_enabled']:
+            raw = int(Decimal(held) * Decimal(u['take_profit_sell_pct']) / 100)
+            if raw < 1:
+                return
+            quote = await self.jupiter_order(mint, WSOL, raw, wallet, int(u['slip_bps']))
+            sol_price = await self.sol_usd()
+            net = max(Decimal(0), Decimal(str(quote['outAmount'])) / Decimal(10**9)
+                      - Decimal('0.003')) * sol_price
+            target = (Decimal(p['cost_usd']) * Decimal(raw) / Decimal(held)
+                      * (Decimal(1) + Decimal(u['take_profit_pct']) / 100))
+            if net >= target:
+                choice = ('TP', raw, target, net)
+        if choice is None:
             return
+
+        kind, raw, threshold, net = choice
         async with self.wallet_lock(wallet):
             u = await self.user(uid)
-            if not u['enabled'] or not u['take_profit_enabled'] or u['address']!=wallet:
+            if (not u['enabled'] or u['address'] != wallet or
+                    not u['stop_loss_enabled'] and kind == 'SL' or
+                    not u['take_profit_enabled'] and kind == 'TP'):
                 return
             if await self.has_unresolved(uid):
                 return
-            if await self.pool.fetchval("SELECT EXISTS(SELECT 1 FROM copy_trades WHERE user_id=$1 AND mint=$2 AND side='SELL' AND status IN ('QUEUED','QUOTING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN','REVIEW_REQUIRED'))",uid,mint):
+            if await self.pool.fetchval("""
+                SELECT EXISTS(SELECT 1 FROM copy_trades
+                WHERE user_id=$1 AND mint=$2 AND side='SELL'
+                  AND status IN ('QUEUED','QUOTING','SIGNED','SUBMITTING',
+                                 'SUBMITTED','UNKNOWN','REVIEW_REQUIRED'))
+            """, uid, mint):
                 return
-            # Claim position atomically before queueing. One TP order per lot.
+            # Re-check holdings under the wallet lock, before claiming the lot.
+            balance, balance_dec = await self.token_balance(wallet, mint)
+            if balance_dec != p['decimals'] or balance < held:
+                await self.pool.execute("""
+                    UPDATE copy_positions SET status='REVIEW'
+                    WHERE id=$1 AND status IN ('OPEN','PARTIAL')
+                """, p['id'])
+                return
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
-                    changed = await conn.fetchval("UPDATE copy_positions SET status='SELLING' WHERE id=$1 AND status='OPEN' RETURNING id",p['id'])
-                    if not changed:
+                    claimed = await conn.fetchval("""
+                        UPDATE copy_positions SET status='SELLING'
+                        WHERE id=$1 AND status IN ('OPEN','PARTIAL')
+                          AND token_amount=$2 RETURNING id
+                    """, p['id'], held)
+                    if not claimed:
                         return
                     await conn.execute("""
-                        INSERT INTO copy_trades(user_id,master_address,master_signature,side,mint,
-                                                status,fraction,venue,tp_position_id,tp_raw_amount)
-                        VALUES($1,$2,$3,'SELL',$4,'QUEUED',1,'pumpfun',$5,$6)
-                        ON CONFLICT(user_id,master_address,master_signature) DO NOTHING
-                    """,uid,wallet,'takeprofit:'+str(p['id'])+':'+secrets.token_hex(6),mint,p['id'],raw)
-            LOG.info('Take profit triggered uid=%s lot=%s target=%s expected_net=%s',uid,p['id'],threshold,expected_net)
-            self.trade_wake.set()
+                        INSERT INTO copy_trades(user_id,master_address,master_signature,
+                                                side,mint,status,fraction,venue,
+                                                tp_position_id,tp_raw_amount,auto_exit_kind)
+                        VALUES($1,$2,$3,'SELL',$4,'QUEUED',1,'pumpfun',$5,$6,$7)
+                    """, uid, wallet,
+                        kind.lower()+':'+str(p['id'])+':'+secrets.token_hex(6),
+                        mint, p['id'], raw, kind)
+        LOG.info('Auto exit queued uid=%s lot=%s type=%s quote=%s threshold=%s',
+                 uid, p['id'], kind, net, threshold)
+        self.trade_wake.set()
 
     # ------------------------------------------------------------------ execution
     async def trade_worker(self):
@@ -2240,7 +2329,7 @@ class BotService:
                         WHERE t.id=picked.id
                         RETURNING t.id,t.user_id,t.master_address,
                                   t.master_signature,t.side,t.mint,
-                                  t.fraction,t.block_time,t.venue,t.created_at,t.tp_position_id,t.tp_raw_amount
+                                  t.fraction,t.block_time,t.venue,t.created_at,t.tp_position_id,t.tp_raw_amount,t.auto_exit_kind
                     """, capacity)
                     for row in rows:
                         task = asyncio.create_task(self.run_trade(row))
@@ -2318,6 +2407,20 @@ class BotService:
                 LOG.info("Copy preparing trade_id=%s uid=%s side=%s venue=%s", tid, uid, side, row["venue"])
                 phase = "SIZING"
                 decimals = None
+                if side == "BUY" and current['prevent_repeat_buys']:
+                    # The wallet lock serializes buys from every followed master.
+                    # Failed/skipped trades do not permanently block the mint.
+                    already_bought = await self.pool.fetchval("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM copy_trades
+                            WHERE user_id=$1 AND mint=$2 AND side='BUY'
+                              AND id<>$3
+                              AND status IN ('CONFIRMED','SIGNED','SUBMITTING',
+                                             'SUBMITTED','UNKNOWN','REVIEW_REQUIRED')
+                        )
+                    """, uid, mint, tid)
+                    if already_bought:
+                        raise ValueError("Token already bought")
                 if side == "BUY":
                     lamports = int((await self.rpc("getBalance", [wallet]))["value"])
                     available_sol = max(0, lamports - MIN_SOL_RESERVE)
@@ -2366,8 +2469,11 @@ class BotService:
                         raise ValueError('Sell in progress')
                     if row['tp_position_id'] is not None:
                         lot = await self.pool.fetchrow('SELECT * FROM copy_positions WHERE id=$1 AND user_id=$2',row['tp_position_id'],uid)
-                        if not current['take_profit_enabled'] or not lot or lot['status'] != 'SELLING' or lot['wallet'] != wallet or lot['mint'] != mint:
+                        if not lot or lot['status'] != 'SELLING' or lot['wallet'] != wallet or lot['mint'] != mint:
                             raise ValueError('Position inactive')
+                        if (row['auto_exit_kind'] == 'SL' and not current['stop_loss_enabled'] or
+                                row['auto_exit_kind'] != 'SL' and not current['take_profit_enabled']):
+                            raise ValueError('Auto exit disabled')
                         raw = min(int(owned),int(row['tp_raw_amount']))
                         if raw < int(row['tp_raw_amount']):
                             raise ValueError('Token balance changed')
@@ -2429,9 +2535,15 @@ class BotService:
                             raise ValueError('Position unavailable')
                         sol_price = await self.sol_usd()
                         expected_net = (Decimal(str(order['outAmount'])) / Decimal(10**9) - Decimal('0.003')) * sol_price
-                        floor = Decimal(lot['cost_usd']) * Decimal(raw) / Decimal(lot['token_amount']) * (Decimal(1) + Decimal(current['take_profit_pct'])/100)
-                        if expected_net < floor:
-                            raise ValueError('Profit target not met')
+                        basis = Decimal(lot['cost_usd']) * Decimal(raw) / Decimal(lot['token_amount'])
+                        if row['auto_exit_kind'] == 'SL':
+                            threshold = basis * (Decimal(1) - Decimal(current['stop_loss_pct'])/100)
+                            if expected_net > threshold:
+                                raise ValueError('Loss limit not met')
+                        else:
+                            threshold = basis * (Decimal(1) + Decimal(current['take_profit_pct'])/100)
+                            if expected_net < threshold:
+                                raise ValueError('Profit target not met')
                     signed_sig, signed_b64, headers = await self.jupiter_execute(order, key)
                     route = "jupiter"
                     if side == "SELL":
@@ -2509,7 +2621,13 @@ class BotService:
                     WHERE id=$1 AND status IN ('QUEUED','QUOTING')
                 """, tid, reason)
                 if row['tp_position_id'] is not None:
-                    new_state = 'OPEN' if (signed_sig is None and reason == 'Profit target not met') else 'REVIEW'
+                    # No signature means no automatic exit was broadcast; a
+                    # price/quote/setting rejection can be retried on a new quote.
+                    # An unexpected token balance is different: attribution is
+                    # unsafe and must remain under review.
+                    new_state = ('OPEN' if signed_sig is None and
+                                 reason not in ('Token balance changed', 'Position inactive')
+                                 else 'REVIEW')
                     await self.pool.execute("UPDATE copy_positions SET status=$2 WHERE id=$1 AND status='SELLING'",row['tp_position_id'],new_state)
                     # Unique per-attempt identifiers preserve historical skips and allow a later retry.
                 LOG.info("Copy skipped trade_id=%s phase=%s reason=%s", tid, phase, reason)
@@ -2520,7 +2638,12 @@ class BotService:
                     WHERE id=$1 AND status IN ('QUEUED','QUOTING')
                 """, tid, "Couldn't complete this trade")
                 if row['tp_position_id'] is not None:
-                    await self.pool.execute("UPDATE copy_positions SET status='REVIEW' WHERE id=$1 AND status='SELLING'",row['tp_position_id'])
+                    # No signature persisted: safe to re-evaluate a fresh quote.
+                    # A signed/unknown submission must never be retried here.
+                    retry_status = 'OPEN' if signed_sig is None else 'REVIEW'
+                    await self.pool.execute(
+                        "UPDATE copy_positions SET status=$2 WHERE id=$1 AND status='SELLING'",
+                        row['tp_position_id'], retry_status)
                 LOG.error("Copy trade failed id=%s phase=%s exc=%s detail=%s",
                           tid, phase, type(exc).__name__, str(exc)[:160])
                 await self.notify(
