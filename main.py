@@ -369,6 +369,7 @@ class BotService:
         self.worker_task = None
         self.reconcile_task = None
         self.take_profit_task = None
+        self.price_task = None
         self.tp_cursor = 0
         self.tp_sem = asyncio.Semaphore(4)
         self.tp_inflight = set()
@@ -378,23 +379,23 @@ class BotService:
         self.ws_signatures_inflight = set()
         self.ws_recent_signatures = {}
         self.ws_signal_times = {}
-        self.rpc_limit = asyncio.Semaphore(4)
+        self.rpc_limit = asyncio.Semaphore(12)
         # Shared pacing/cooldown across ALL HTTP RPC users (monitoring + execution).
         self.rpc_pace_lock = asyncio.Lock()
         self.monitor_sem = asyncio.Semaphore(2)  # poll two distinct masters concurrently
         self.rpc_next_at = 0.0
         self.rpc_cooldown_until = 0.0
-        # Default to 10 HTTP RPC requests/second; a shared 429 cooldown backs off
-        # automatically. Override in /etc/tg-bot.env if the Helius plan requires it.
+        # Default to fast 50ms pacing (allows up to 20 req/s); sendTransaction bypasses pacing completely.
         try:
-            rpc_interval_ms = float(os.getenv("HELIUS_RPC_MIN_INTERVAL_MS", "100"))
+            rpc_interval_ms = float(os.getenv("HELIUS_RPC_MIN_INTERVAL_MS", "50"))
         except (TypeError, ValueError):
-            rpc_interval_ms = 100.0
-        self.rpc_spacing_seconds = max(0.05, min(1.0, rpc_interval_ms / 1000.0))
+            rpc_interval_ms = 50.0
+        self.rpc_spacing_seconds = max(0.02, min(1.0, rpc_interval_ms / 1000.0))
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
         self.hot_addresses = set()
+        self.seen_signatures = set()
         self.poll_locks = {}
         self.poll_cooldowns = {}
         self.wallet_locks = {}
@@ -451,6 +452,7 @@ class BotService:
         self.worker_task = asyncio.create_task(self.trade_worker())
         self.reconcile_task = asyncio.create_task(self.reconcile_loop())
         self.take_profit_task = asyncio.create_task(self.take_profit_loop())
+        self.price_task = asyncio.create_task(self.sol_price_loop())
         await app.bot.set_my_commands([
             BotCommand("start", "Open dashboard"),
             BotCommand("wallet", "Manage wallets"),
@@ -467,7 +469,7 @@ class BotService:
 
     async def shutdown(self, app):
         for task in (self.monitor_task, self.cleanup_task, self.ws_task,
-                     self.worker_task, self.reconcile_task, self.take_profit_task):
+                     self.worker_task, self.reconcile_task, self.take_profit_task, self.price_task):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -497,22 +499,28 @@ class BotService:
         """
         attempts = 1 if method == "sendTransaction" else 4
         for attempt in range(attempts):
-            # Reserve a pacing slot under the lock, then wait outside it.
-            # This prevents one delayed RPC from holding every other caller.
-            async with self.rpc_pace_lock:
-                now = time.monotonic()
-                ready = max(now, self.rpc_next_at, self.rpc_cooldown_until)
-                self.rpc_next_at = ready + self.rpc_spacing_seconds
-            delay = ready - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            # A 429 may have established a cooldown after this slot was reserved.
-            while True:
+            if method != "sendTransaction":
+                # Reserve a pacing slot under the lock, then wait outside it.
+                # This prevents one delayed RPC from holding every other caller.
                 async with self.rpc_pace_lock:
-                    remaining = self.rpc_cooldown_until - time.monotonic()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(remaining)
+                    now = time.monotonic()
+                    ready = max(now, self.rpc_next_at, self.rpc_cooldown_until)
+                    self.rpc_next_at = ready + self.rpc_spacing_seconds
+                delay = ready - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                # A 429 may have established a cooldown after this slot was reserved.
+                while True:
+                    async with self.rpc_pace_lock:
+                        remaining = self.rpc_cooldown_until - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(remaining)
+            else:
+                # sendTransaction bypasses routine spacing pacing; only respect active 429 backoff
+                now = time.monotonic()
+                if self.rpc_cooldown_until > now:
+                    await asyncio.sleep(self.rpc_cooldown_until - now)
             try:
                 async with self.rpc_limit:
                     async with self.session.post(RPC, json={
@@ -1649,9 +1657,8 @@ class BotService:
             signed_b64,
             {
                 "encoding": "base64",
-                "skipPreflight": False,
-                "preflightCommitment": "confirmed",
-                "maxRetries": 0,
+                "skipPreflight": True,
+                "maxRetries": 3,
             },
         ])
 
@@ -1829,7 +1836,7 @@ class BotService:
                                         await ws.send_json({
                                             "jsonrpc": "2.0", "id": req,
                                             "method": "logsSubscribe",
-                                            "params": [{"mentions": [addr]}, {"commitment": "confirmed"}],
+                                            "params": [{"mentions": [addr]}, {"commitment": "processed"}],
                                         })
                                         continue
                                     raise RuntimeError("standard logs subscription rejected")
@@ -1848,7 +1855,10 @@ class BotService:
                                 params = payload.get("params") or {}
                                 info = subs.get(params.get("subscription"))
                                 value = (params.get("result") or {}).get("value") or {}
-                                if info and info[1] == "logs" and not value.get("err"):
+                                if info and not value.get("err"):
+                                    sig = value.get("signature")
+                                    if sig:
+                                        self.schedule_ws_transaction(info[0], {"signature": sig})
                                     self.hot_addresses.add(info[0])
                                     self.ws_signal.set()
                         elif msg.type in (
@@ -1900,17 +1910,33 @@ class BotService:
                     raise ValueError("Trade cost exceeded limit")
             return data
 
+    async def sol_price_loop(self):
+        while True:
+            try:
+                quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
+                val = Decimal(str(quote["outAmount"])) / Decimal(100_000)
+                if val > 0:
+                    self.price_cache = (time.monotonic(), val)
+            except Exception:
+                pass
+            await asyncio.sleep(20)
+
     async def sol_usd(self):
         now = time.monotonic()
         ts, cached = self.price_cache
-        if cached is not None and now - ts < 12:
+        if cached is not None and now - ts < 60:
             return cached
-        quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
-        value = Decimal(str(quote["outAmount"])) / Decimal(100_000)
-        if value <= 0:
-            raise RuntimeError("Invalid SOL/USD quote")
-        self.price_cache = (now, value)
-        return value
+        try:
+            quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
+            value = Decimal(str(quote["outAmount"])) / Decimal(100_000)
+            if value <= 0:
+                raise RuntimeError("Invalid SOL/USD quote")
+            self.price_cache = (now, value)
+            return value
+        except Exception:
+            if cached is not None:
+                return cached
+            raise
 
     async def jupiter_execute(self, order, key):
         if str(order.get("transactionVersion", "0")) not in ("0", "legacy"):
@@ -2706,7 +2732,7 @@ class BotService:
                 prepare_started = time.monotonic()
                 pump_venue = row["venue"] in ("pumpfun", "pumpswap")
 
-                if current["use_pumpportal"] and pump_venue and row["tp_position_id"] is None and (side == "SELL" or source == WSOL):
+                if current["use_pumpportal"] and pump_venue and (side == "SELL" or source == WSOL):
                     try:
                         if side == "BUY":
                             amount_arg = Decimal(raw) / Decimal(10**9)
@@ -2851,7 +2877,7 @@ class BotService:
 
     # ------------------------------------------------------------------ monitoring
     async def get_transaction(self, signature):
-        for attempt in range(4):
+        for attempt in range(5):
             tx = await self.rpc("getTransaction", [
                 signature,
                 {
@@ -2862,7 +2888,7 @@ class BotService:
             ])
             if tx is not None:
                 return tx
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.2)
         raise RuntimeError("RPC transaction details not ready")
 
     async def poll_master(self, address, max_age):
