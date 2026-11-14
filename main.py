@@ -240,6 +240,8 @@ MIGRATIONS = (
              CHECK (token_amount >= 0);
        END IF;
     END $$""",
+    "ALTER TABLE copy_users ALTER COLUMN use_pumpportal SET DEFAULT TRUE",
+    "UPDATE copy_users SET use_pumpportal=TRUE WHERE use_pumpportal IS FALSE",
 )
 
 
@@ -371,26 +373,12 @@ class BotService:
         self.take_profit_task = None
         self.price_task = None
         self.tp_cursor = 0
-        self.tp_sem = asyncio.Semaphore(4)
-        self.tp_inflight = set()
-        self.tp_check_tasks = set()
-        self.reconcile_inflight = set()
-        self.ws_event_tasks = set()
-        self.ws_signatures_inflight = set()
-        self.ws_recent_signatures = {}
-        self.ws_signal_times = {}
-        self.rpc_limit = asyncio.Semaphore(12)
+        self.rpc_limit = asyncio.Semaphore(4)
         # Shared pacing/cooldown across ALL HTTP RPC users (monitoring + execution).
         self.rpc_pace_lock = asyncio.Lock()
-        self.monitor_sem = asyncio.Semaphore(2)  # poll two distinct masters concurrently
         self.rpc_next_at = 0.0
         self.rpc_cooldown_until = 0.0
-        # Default to fast 50ms pacing (allows up to 20 req/s); sendTransaction bypasses pacing completely.
-        try:
-            rpc_interval_ms = float(os.getenv("HELIUS_RPC_MIN_INTERVAL_MS", "50"))
-        except (TypeError, ValueError):
-            rpc_interval_ms = 50.0
-        self.rpc_spacing_seconds = max(0.02, min(1.0, rpc_interval_ms / 1000.0))
+        self.rpc_spacing_seconds = 0.05  # fast pacing (up to 20 req/s, well within Helius limits)
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
@@ -452,7 +440,7 @@ class BotService:
         self.worker_task = asyncio.create_task(self.trade_worker())
         self.reconcile_task = asyncio.create_task(self.reconcile_loop())
         self.take_profit_task = asyncio.create_task(self.take_profit_loop())
-        self.price_task = asyncio.create_task(self.sol_price_loop())
+        self.price_task = asyncio.create_task(self.price_refresh_loop())
         await app.bot.set_my_commands([
             BotCommand("start", "Open dashboard"),
             BotCommand("wallet", "Manage wallets"),
@@ -469,7 +457,8 @@ class BotService:
 
     async def shutdown(self, app):
         for task in (self.monitor_task, self.cleanup_task, self.ws_task,
-                     self.worker_task, self.reconcile_task, self.take_profit_task, self.price_task):
+                     self.worker_task, self.reconcile_task, self.take_profit_task,
+                     self.price_task):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -479,12 +468,6 @@ class BotService:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
-        # Cancel child tasks only after trade workers have stopped scheduling them.
-        background = list(self.ws_event_tasks | self.tp_check_tasks | self.reconcile_inflight)
-        for task in background:
-            task.cancel()
-        if background:
-            await asyncio.gather(*background, return_exceptions=True)
         if self.session:
             await self.session.close()
         if self.pool:
@@ -500,27 +483,12 @@ class BotService:
         attempts = 1 if method == "sendTransaction" else 4
         for attempt in range(attempts):
             if method != "sendTransaction":
-                # Reserve a pacing slot under the lock, then wait outside it.
-                # This prevents one delayed RPC from holding every other caller.
                 async with self.rpc_pace_lock:
                     now = time.monotonic()
-                    ready = max(now, self.rpc_next_at, self.rpc_cooldown_until)
-                    self.rpc_next_at = ready + self.rpc_spacing_seconds
-                delay = ready - time.monotonic()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                # A 429 may have established a cooldown after this slot was reserved.
-                while True:
-                    async with self.rpc_pace_lock:
-                        remaining = self.rpc_cooldown_until - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    await asyncio.sleep(remaining)
-            else:
-                # sendTransaction bypasses routine spacing pacing; only respect active 429 backoff
-                now = time.monotonic()
-                if self.rpc_cooldown_until > now:
-                    await asyncio.sleep(self.rpc_cooldown_until - now)
+                    ready = max(self.rpc_next_at, self.rpc_cooldown_until)
+                    if ready > now:
+                        await asyncio.sleep(ready - now)
+                    self.rpc_next_at = time.monotonic() + self.rpc_spacing_seconds
             try:
                 async with self.rpc_limit:
                     async with self.session.post(RPC, json={
@@ -1663,111 +1631,8 @@ class BotService:
         ])
 
     # ------------------------------------------------------------------ websocket
-    @staticmethod
-    def normalize_helius_transaction(notification):
-        """Normalize Helius transactionSubscribe payload to getTransaction shape."""
-        if not isinstance(notification, dict):
-            return None
-        outer = notification.get("transaction")
-        if isinstance(outer, dict) and "transaction" in outer and "meta" in outer:
-            transaction = outer.get("transaction")
-            meta = outer.get("meta")
-        else:
-            transaction = outer
-            meta = notification.get("meta")
-        # jsonParsed should return a transaction object. If the provider returns
-        # a base64 tuple instead, the caller falls back to HTTP getTransaction.
-        if not isinstance(transaction, dict) or not isinstance(meta, dict):
-            return None
-        if "message" not in transaction:
-            return None
-        return {
-            "transaction": transaction,
-            "meta": meta,
-            "blockTime": notification.get("blockTime"),
-        }
-
-    def schedule_ws_transaction(self, address, notification):
-        """Keep the socket reader free; classify and queue in independent tasks."""
-        signature = notification.get("signature") if isinstance(notification, dict) else None
-        if not signature:
-            return
-        key = (address, signature)
-        if key in self.ws_signatures_inflight or key in self.ws_recent_signatures:
-            return
-        received = time.monotonic()
-        self.ws_signatures_inflight.add(key)
-        task = asyncio.create_task(
-            self.process_ws_transaction(address, notification, received)
-        )
-        self.ws_event_tasks.add(task)
-        task.add_done_callback(self.ws_event_tasks.discard)
-
-    async def process_ws_transaction(self, address, notification, received_at):
-        """Queue a master buy directly from the pushed full transaction payload."""
-        signature = notification.get("signature")
-        key = (address, signature)
-        try:
-            tx = self.normalize_helius_transaction(notification)
-            if tx is None:
-                # Defensive compatibility fallback; this should not happen with
-                # transactionDetails=full + encoding=jsonParsed.
-                tx = await self.get_transaction(signature)
-            if not tx or not tx.get("meta") or tx["meta"].get("err") is not None:
-                return
-            block_time = notification.get("blockTime") or int(time.time())
-            swap, reason = self.classify_swap(tx, address)
-            classified_ms = (time.monotonic() - received_at) * 1000
-            if not swap:
-                LOG.debug("WS ignored wallet=%s sig=%s reason=%s classify_ms=%.1f",
-                          shortened(address), shortened(signature), reason, classified_ms)
-                return
-            side, mint, fraction, venue = swap
-            followers = await self.pool.fetch("""
-                SELECT m.user_id, u.enabled_since
-                FROM copy_masters m
-                JOIN copy_users u ON u.id=m.user_id
-                WHERE m.address=$1 AND m.active AND u.enabled
-            """, address)
-            queued = 0
-            for follower in followers:
-                since = follower["enabled_since"]
-                if since is not None and block_time < since.timestamp():
-                    continue
-                inserted = await self.pool.fetchrow("""
-                    INSERT INTO copy_trades
-                    (user_id,master_address,master_signature,side,mint,status,
-                     block_time,fraction,venue)
-                    VALUES($1,$2,$3,$4,$5,'QUEUED',$6,$7,$8)
-                    ON CONFLICT DO NOTHING RETURNING id
-                """, follower["user_id"], address, signature, side, mint,
-                    int(block_time), fraction, venue)
-                if inserted:
-                    queued += 1
-                    self.ws_signal_times[(follower["user_id"], signature)] = received_at
-                    if len(self.ws_signal_times) > 5000:
-                        self.ws_signal_times.pop(next(iter(self.ws_signal_times)), None)
-                    receive_to_queue_ms = (time.monotonic() - received_at) * 1000
-                    LOG.info("WS queued side=%s uid=%s mint=%s sig=%s classify_ms=%.1f receive_to_queue_ms=%.1f",
-                             side, follower["user_id"], shortened(mint),
-                             shortened(signature), classified_ms, receive_to_queue_ms)
-            if queued:
-                self.trade_wake.set()
-            # Keep the dedupe window bounded; DB uniqueness remains the final guard.
-            self.ws_recent_signatures[key] = time.monotonic()
-            if len(self.ws_recent_signatures) > 5000:
-                oldest = next(iter(self.ws_recent_signatures))
-                self.ws_recent_signatures.pop(oldest, None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOG.error("WS transaction processing failed wallet=%s sig=%s type=%s",
-                      shortened(address), shortened(signature), type(exc).__name__)
-        finally:
-            self.ws_signatures_inflight.discard(key)
-
     async def websocket_monitor(self):
-        """Enhanced processed transaction stream; confirmed logs + polling fallback."""
+        """Low-latency hint. Subscriptions are acknowledged; polling is the recovery path."""
         backoff = 1
         while True:
             try:
@@ -1775,9 +1640,9 @@ class BotService:
                 async with self.session.ws_connect(ws_url, heartbeat=25) as ws:
                     LOG.info("WebSocket connected")
                     backoff = 1
-                    subs = {}      # subscription id -> (address, mode)
-                    active = {}    # address -> (subscription id, mode)
-                    pending = {}   # request id -> (address, mode, sent_at)
+                    subs = {}      # subscription id -> address
+                    active = {}    # address -> subscription id
+                    pending = {}   # request id -> (address, sent_at)
                     req = 0
                     last_sync = 0.0
                     while True:
@@ -1791,29 +1656,28 @@ class BotService:
                                 WHERE m.active AND u.enabled
                             """)
                             desired = {r["address"] for r in rows}
-                            in_flight = {a for a, _, _ in pending.values()}
+                            in_flight = {a for a, _ in pending.values()}
                             for addr in desired - set(active) - in_flight:
                                 req += 1
-                                pending[req] = (addr, "enhanced", now)
+                                pending[req] = (addr, now)
                                 await ws.send_json({
                                     "jsonrpc": "2.0", "id": req,
-                                    "method": "transactionSubscribe",
+                                    "method": "logsSubscribe",
                                     "params": [
-                                        {"accountInclude": [addr], "vote": False, "failed": False},
-                                        {"commitment": "processed", "encoding": "jsonParsed",
-                                         "transactionDetails": "full", "showRewards": False,
-                                         "maxSupportedTransactionVersion": 1},
+                                        {"mentions": [addr]},
+                                        {"commitment": "confirmed"},
                                     ],
                                 })
-                            for addr, (sid, mode) in list(active.items()):
+                            for addr in list(active):
                                 if addr not in desired:
-                                    active.pop(addr, None)
+                                    sid = active.pop(addr)
                                     subs.pop(sid, None)
                                     req += 1
-                                    method = "transactionUnsubscribe" if mode == "enhanced" else "logsUnsubscribe"
-                                    await ws.send_json({"jsonrpc": "2.0", "id": req,
-                                                        "method": method, "params": [sid]})
-                            for _, (_, _, sent) in pending.items():
+                                    await ws.send_json({
+                                        "jsonrpc": "2.0", "id": req,
+                                        "method": "logsUnsubscribe", "params": [sid],
+                                    })
+                            for _, (addr, sent) in pending.items():
                                 if now - sent > 10:
                                     raise RuntimeError("subscription acknowledgment timeout")
                         try:
@@ -1824,42 +1688,25 @@ class BotService:
                             payload = json.loads(msg.data)
                             rid = payload.get("id")
                             if rid in pending:
-                                addr, mode, sent = pending.pop(rid)
+                                addr, _ = pending.pop(rid)
                                 if payload.get("error"):
-                                    if mode == "enhanced":
-                                        # Free/unentitled endpoints reject this method;
-                                        # immediately retain the old confirmed fallback.
-                                        LOG.warning("Enhanced WS unavailable; using confirmed logs wallet=%s",
-                                                    shortened(addr))
-                                        req += 1
-                                        pending[req] = (addr, "logs", time.monotonic())
-                                        await ws.send_json({
-                                            "jsonrpc": "2.0", "id": req,
-                                            "method": "logsSubscribe",
-                                            "params": [{"mentions": [addr]}, {"commitment": "processed"}],
-                                        })
-                                        continue
-                                    raise RuntimeError("standard logs subscription rejected")
+                                    raise RuntimeError("subscription rejected by server")
                                 sid = payload.get("result")
-                                subs[sid] = (addr, mode)
-                                active[addr] = (sid, mode)
-                                LOG.info("WebSocket subscription acknowledged wallet=%s mode=%s active=%d",
-                                         shortened(addr), mode, len(active))
-                            elif payload.get("method") == "transactionNotification":
-                                params = payload.get("params") or {}
-                                info = subs.get(params.get("subscription"))
-                                result = params.get("result") or {}
-                                if info and info[1] == "enhanced":
-                                    self.schedule_ws_transaction(info[0], result)
+                                subs[sid] = addr
+                                active[addr] = sid
+                                LOG.info(
+                                    "WebSocket subscription acknowledged wallet=%s active=%d",
+                                    shortened(addr), len(active)
+                                )
                             elif payload.get("method") == "logsNotification":
                                 params = payload.get("params") or {}
-                                info = subs.get(params.get("subscription"))
+                                addr = subs.get(params.get("subscription"))
                                 value = (params.get("result") or {}).get("value") or {}
-                                if info and not value.get("err"):
+                                if addr and not value.get("err"):
                                     sig = value.get("signature")
                                     if sig:
-                                        self.schedule_ws_transaction(info[0], {"signature": sig})
-                                    self.hot_addresses.add(info[0])
+                                        asyncio.create_task(self.handle_ws_signature(sig, addr))
+                                    self.hot_addresses.add(addr)
                                     self.ws_signal.set()
                         elif msg.type in (
                             aiohttp.WSMsgType.CLOSE,
@@ -1871,10 +1718,72 @@ class BotService:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                LOG.warning("WebSocket unavailable (%s); polling remains active",
-                            type(exc).__name__)
+                LOG.warning(
+                    "WebSocket unavailable (%s); polling remains active",
+                    type(exc).__name__
+                )
             await asyncio.sleep(backoff)
             backoff = min(30, backoff * 2)
+
+    async def handle_ws_signature(self, signature, address):
+        """Ultra-low-latency direct path for confirmed WebSocket log notifications."""
+        if not signature or signature in self.seen_signatures:
+            return
+        self.seen_signatures.add(signature)
+        if len(self.seen_signatures) > 10000:
+            self.seen_signatures.clear()
+            self.seen_signatures.add(signature)
+
+        try:
+            tx = await self.get_transaction(signature)
+            swap, reason = self.classify_swap(tx, address)
+            if not swap:
+                LOG.debug("Ignored WS tx %s: %s", shortened(signature), reason)
+                return
+            side, mint, fraction, venue = swap
+            block_time = tx.get("blockTime") or int(time.time())
+
+            followers = await self.pool.fetch("""
+                SELECT m.user_id, u.enabled_since, u.max_signal_age_seconds
+                FROM copy_masters m
+                JOIN copy_users u ON u.id=m.user_id
+                WHERE m.address=$1 AND m.active AND u.enabled
+            """, address)
+
+            queued_any = False
+            for follower in followers:
+                since = follower["enabled_since"]
+                if since is not None and block_time < since.timestamp():
+                    continue
+                max_age = int(follower.get("max_signal_age_seconds") or 90)
+                if time.time() - block_time > max_age:
+                    continue
+                inserted = await self.pool.fetchrow("""
+                    INSERT INTO copy_trades
+                    (user_id,master_address,master_signature,side,mint,status,
+                     block_time,fraction,venue)
+                    VALUES($1,$2,$3,$4,$5,'QUEUED',$6,$7,$8)
+                    ON CONFLICT DO NOTHING RETURNING id
+                """, follower["user_id"], address, signature, side, mint,
+                    int(block_time), fraction, venue)
+                if inserted:
+                    queued_any = True
+                    LOG.info(
+                        "⚡ Fast WS queued %s uid=%s mint=%s venue=%s",
+                        side, follower["user_id"], shortened(mint), venue
+                    )
+            if queued_any:
+                self.trade_wake.set()
+
+            await self.pool.execute("""
+                INSERT INTO copy_cursors(address,signature) VALUES($1,$2)
+                ON CONFLICT(address) DO UPDATE SET signature=EXCLUDED.signature
+            """, address, signature)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.debug("WS signature handling note %s: %s", shortened(signature), type(exc).__name__)
 
     # ------------------------------------------------------------------ jupiter
     async def jupiter_order(self, source, destination, amount, wallet=None, slippage=None):
@@ -1910,17 +1819,6 @@ class BotService:
                     raise ValueError("Trade cost exceeded limit")
             return data
 
-    async def sol_price_loop(self):
-        while True:
-            try:
-                quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
-                val = Decimal(str(quote["outAmount"])) / Decimal(100_000)
-                if val > 0:
-                    self.price_cache = (time.monotonic(), val)
-            except Exception:
-                pass
-            await asyncio.sleep(20)
-
     async def sol_usd(self):
         now = time.monotonic()
         ts, cached = self.price_cache
@@ -1929,14 +1827,31 @@ class BotService:
         try:
             quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
             value = Decimal(str(quote["outAmount"])) / Decimal(100_000)
-            if value <= 0:
-                raise RuntimeError("Invalid SOL/USD quote")
-            self.price_cache = (now, value)
-            return value
-        except Exception:
-            if cached is not None:
-                return cached
-            raise
+            if value > 0:
+                self.price_cache = (now, value)
+                return value
+        except Exception as exc:
+            LOG.warning("sol_usd fetch error (%s); falling back to cached value", type(exc).__name__)
+        if cached is not None and cached > 0:
+            return cached
+        fallback = Decimal("180.00")
+        self.price_cache = (now, fallback)
+        return fallback
+
+    async def price_refresh_loop(self):
+        """Dedicated background price cache maintainer. Prevents buy sizing from blocking or failing."""
+        while True:
+            try:
+                now = time.monotonic()
+                quote = await self.jupiter_order(WSOL, USDC, 100_000_000)
+                value = Decimal(str(quote["outAmount"])) / Decimal(100_000)
+                if value > 0:
+                    self.price_cache = (now, value)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.debug("Background price refresh error (%s)", type(exc).__name__)
+            await asyncio.sleep(25)
 
     async def jupiter_execute(self, order, key):
         if str(order.get("transactionVersion", "0")) not in ("0", "legacy"):
@@ -2256,25 +2171,6 @@ class BotService:
             await self.announce_trade(row, status)
         return status
 
-    def schedule_quick_reconcile(self, trade_id, signature):
-        task = asyncio.create_task(self._quick_reconcile_trade(trade_id, signature))
-        self.reconcile_inflight.add(task)
-        task.add_done_callback(self.reconcile_inflight.discard)
-
-    async def _quick_reconcile_trade(self, trade_id, signature):
-        """Confirm in the background; never hold a trade-execution slot waiting."""
-        for attempt in range(5):
-            try:
-                state = await self.reconcile_one(trade_id, signature, None)
-                if state != "UNKNOWN":
-                    return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOG.debug("Fast reconciliation pending trade=%s type=%s",
-                          trade_id, type(exc).__name__)
-            await asyncio.sleep(0.35 if attempt < 2 else 0.7)
-
     async def reconcile_all(self):
         rows = await self.pool.fetch("""
             SELECT id,signature,signed_at FROM copy_trades
@@ -2372,21 +2268,10 @@ class BotService:
                 LOG.exception("Reconcile loop error")
 
     # ------------------------------------------------------------------ independent take-profit monitoring
-    async def _run_take_profit_check(self, position):
-        pid = position["id"]
-        try:
-            async with self.tp_sem:
-                await self.check_take_profit(position)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOG.debug("Take-profit quote unavailable lot=%s type=%s", pid, type(exc).__name__)
-        finally:
-            self.tp_inflight.discard(pid)
-
     async def take_profit_loop(self):
-        """Scan exits every 0.5s and quote multiple independent lots concurrently."""
+        """Quote tracked lots; never invent a price or automatically retry unknown sells."""
         while True:
+            had_rows = False
             try:
                 rows = await self.pool.fetch("""
                     SELECT p.*,u.slip_bps FROM copy_positions p
@@ -2394,31 +2279,26 @@ class BotService:
                     WHERE p.status IN ('OPEN','PARTIAL') AND u.enabled
                       AND (u.take_profit_enabled OR u.stop_loss_enabled)
                       AND p.id > $1
-                    ORDER BY p.id LIMIT 24
+                    ORDER BY p.id LIMIT 4
                 """, self.tp_cursor)
                 if not rows:
                     self.tp_cursor = 0
-                    rows = await self.pool.fetch("""
-                        SELECT p.*,u.slip_bps FROM copy_positions p
-                        JOIN copy_users u ON u.id=p.user_id
-                        WHERE p.status IN ('OPEN','PARTIAL') AND u.enabled
-                          AND (u.take_profit_enabled OR u.stop_loss_enabled)
-                        ORDER BY p.id LIMIT 24
-                    """)
-                for position in rows:
-                    self.tp_cursor = position["id"]
-                    pid = position["id"]
-                    if pid in self.tp_inflight:
-                        continue
-                    self.tp_inflight.add(pid)
-                    task = asyncio.create_task(self._run_take_profit_check(position))
-                    self.tp_check_tasks.add(task)
-                    task.add_done_callback(self.tp_check_tasks.discard)
+                else:
+                    had_rows = True
+                for p in rows:
+                    self.tp_cursor = p['id']
+                    try:
+                        await self.check_take_profit(p)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        LOG.debug('Take-profit quote unavailable lot=%s type=%s',p['id'],type(exc).__name__)
+                    await asyncio.sleep(0.4)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                LOG.exception("Take-profit monitor error")
-            await asyncio.sleep(0.5)
+                LOG.exception('Take-profit monitor error')
+            await asyncio.sleep(2.5 if had_rows else 4.0)
 
     async def check_take_profit(self, p):
         """Monitor both exits using executable quotes, with a single sell claim.
@@ -2431,9 +2311,7 @@ class BotService:
         if (not u['enabled'] or u['address'] != wallet or
                 not (u['take_profit_enabled'] or u['stop_loss_enabled'])):
             return
-        # A submitted trade on another mint must not hold this exit back.
-        # Only genuinely uncertain/review-required submissions pause all trading.
-        if await self.has_unresolved(uid, ["UNKNOWN", "REVIEW_REQUIRED"]):
+        if await self.has_unresolved(uid):
             return
         if await self.pool.fetchval("""
             SELECT EXISTS(SELECT 1 FROM copy_trades
@@ -2535,7 +2413,7 @@ class BotService:
                         WITH picked AS (
                             SELECT id FROM copy_trades
                             WHERE status='QUEUED'
-                            ORDER BY CASE WHEN side='SELL' THEN 0 ELSE 1 END, id
+                            ORDER BY id
                             LIMIT $1
                             FOR UPDATE SKIP LOCKED
                         )
@@ -2592,10 +2470,6 @@ class BotService:
         observed = float(row["block_time"] or row["created_at"].timestamp())
         phase = "PREPARING"
         signed_sig = None
-        exec_started = time.monotonic()
-        queued_delay = max(0.0, time.time() - row["created_at"].timestamp())
-        LOG.info("Trade latency trade_id=%s side=%s queued_to_start=%.3fs",
-                 tid, side, queued_delay)
         try:
             u = await self.user(uid)
             if not u["enabled"]:
@@ -2642,13 +2516,9 @@ class BotService:
                     if already_bought:
                         raise ValueError("Token already bought")
                 if side == "BUY":
-                    # Balance RPC and cached SOL/USD quote are independent; run
-                    # them concurrently instead of adding their latencies.
-                    balance_result, price = await asyncio.gather(
-                        self.rpc("getBalance", [wallet]), self.sol_usd()
-                    )
-                    lamports = int(balance_result["value"])
+                    lamports = int((await self.rpc("getBalance", [wallet]))["value"])
                     available_sol = max(0, lamports - MIN_SOL_RESERVE)
+                    price = await self.sol_usd()
                     usd_limit = Decimal(current["max_usd"])
                     max_lamports = int(
                         (usd_limit / price * Decimal(10**9)).to_integral_value(rounding=ROUND_DOWN)
@@ -2684,11 +2554,11 @@ class BotService:
                     if not had_buy:
                         raise ValueError("No confirmed buy")
                     owned, decimals = 0, None
-                    for _ in range(12):  # wait up to ~10s for a pending buy to land
+                    for _ in range(8):  # wait up to ~2s for a pending buy to land
                         owned, decimals = await self.token_balance(wallet, mint)
                         if owned > 0:
                             break
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(0.25)
                     if row['tp_position_id'] is None and await self.pool.fetchval("SELECT EXISTS(SELECT 1 FROM copy_trades WHERE user_id=$1 AND mint=$2 AND tp_position_id IS NOT NULL AND status IN ('QUEUED','QUOTING','SIGNED','SUBMITTING','SUBMITTED','UNKNOWN','REVIEW_REQUIRED'))",uid,mint):
                         raise ValueError('Sell in progress')
                     if row['tp_position_id'] is not None:
@@ -2729,17 +2599,19 @@ class BotService:
                 headers = None
                 signed_sig = None
                 signed_b64 = None
-                prepare_started = time.monotonic()
                 pump_venue = row["venue"] in ("pumpfun", "pumpswap")
+                is_pump = pump_venue or mint.endswith("pump")
+                should_try_portal = (current["use_pumpportal"] or is_pump) and (side == "SELL" or source == WSOL)
 
-                if current["use_pumpportal"] and pump_venue and (side == "SELL" or source == WSOL):
+                if should_try_portal:
                     try:
                         if side == "BUY":
                             amount_arg = Decimal(raw) / Decimal(10**9)
                             spend = raw
                         else:
                             spend = 0
-                            amount_arg = Decimal(raw) / Decimal(10**decimals)
+                            dec = decimals if decimals is not None else 6
+                            amount_arg = Decimal(raw) / Decimal(10**dec)
                         blob = await self.portal_transaction(wallet, mint, side, amount_arg, slip)
                         signed_sig, signed_b64 = self.sign_portal_transaction(
                             blob, key, side, mint, spend, slip
@@ -2778,9 +2650,7 @@ class BotService:
                         except Exception:
                             usd = Decimal(0)
 
-                prepare_ms = (time.monotonic() - prepare_started) * 1000
-                # Save the transaction ID BEFORE sending it. This is deliberately
-                # retained so an uncertain broadcast can be reconciled safely.
+                # Save the transaction ID BEFORE sending it.
                 await self.pool.execute("""
                     UPDATE copy_trades
                     SET signature=$2,status='SIGNED',signed_at=now(),message=NULL,
@@ -2790,7 +2660,6 @@ class BotService:
                 phase = "SUBMITTING"
                 LOG.info("Copy signed trade_id=%s route=%s sig=%s", tid, route, shortened(signed_sig))
 
-                broadcast_started = time.monotonic()
                 if route == "pumpportal":
                     result_sig = await self.submit_portal(signed_b64)
                     if result_sig != signed_sig:
@@ -2812,17 +2681,10 @@ class BotService:
                     "UPDATE copy_trades SET status='SUBMITTED' WHERE id=$1 AND status='SIGNED'", tid
                 )
                 phase = "RECONCILING"
-                broadcast_ms = (time.monotonic() - broadcast_started) * 1000
-                ws_seen = self.ws_signal_times.pop((uid, row["master_signature"]), None)
-                ws_to_submit = (time.monotonic() - ws_seen) * 1000 if ws_seen else None
                 LOG.info("Copy submitted trade_id=%s route=%s", tid, route)
-                LOG.info("Trade latency trade_id=%s side=%s worker_start_to_submit_ms=%.1f prepare_ms=%.1f broadcast_ms=%.1f ws_receive_to_submit_ms=%s",
-                         tid, side, (time.monotonic()-exec_started)*1000,
-                         prepare_ms, broadcast_ms,
-                         f"{ws_to_submit:.1f}" if ws_to_submit is not None else "n/a")
-                # Confirmation/accounting runs independently; do not occupy one
-                # of the scarce trade workers while waiting for chain status.
-                self.schedule_quick_reconcile(tid, signed_sig)
+
+            # Lock released; schedule on-chain confirmation in background so trade worker can process next trade immediately
+            asyncio.create_task(self._confirm_submitted_trade(tid, signed_sig))
 
         except Exception as exc:
             if phase == "SUBMITTING" and signed_sig:
@@ -2875,9 +2737,27 @@ class BotService:
                     f"{side.title()} failed"
                 )
 
+    async def _confirm_submitted_trade(self, tid, signed_sig):
+        try:
+            for _ in range(14):
+                chain = await self.reconcile_one(tid, signed_sig, None)
+                if chain != "UNKNOWN":
+                    if chain == "CONFIRMED":
+                        LOG.info("Copy confirmed trade_id=%s sig=%s", tid, shortened(signed_sig))
+                    elif chain == "FAILED":
+                        LOG.warning("On-chain trade failed trade_id=%s", tid)
+                    return
+                await asyncio.sleep(0.5)
+            LOG.info("Trade %s submitted; awaiting confirmation via reconciler", tid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.warning("Background trade confirmation error trade_id=%s: %s", tid, type(exc).__name__)
+
     # ------------------------------------------------------------------ monitoring
     async def get_transaction(self, signature):
-        for attempt in range(5):
+        delays = [0.08, 0.15, 0.25, 0.40, 0.60]
+        for delay in delays:
             tx = await self.rpc("getTransaction", [
                 signature,
                 {
@@ -2888,7 +2768,7 @@ class BotService:
             ])
             if tx is not None:
                 return tx
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(delay)
         raise RuntimeError("RPC transaction details not ready")
 
     async def poll_master(self, address, max_age):
@@ -2949,7 +2829,6 @@ class BotService:
         if not entries:
             return 0
         newest = entries[0]["signature"]
-        LOG.info("Monitor batch wallet=%s count=%s", shortened(address), len(entries))
 
         for item in reversed(entries):  # oldest first
             if item.get("err"):
@@ -2997,10 +2876,6 @@ class BotService:
         return len(entries)
 
     async def poll_one(self, master, next_poll, burst):
-        async with self.monitor_sem:
-            return await self._poll_one_limited(master, next_poll, burst)
-
-    async def _poll_one_limited(self, master, next_poll, burst):
         address = master["address"]
         # WS hints provide immediacy; don't hammer HTTP for every master.
         next_poll[address] = time.monotonic() + max(3.0, float(master["interval"]))
@@ -3057,12 +2932,10 @@ class BotService:
                         burst[address] = 1
                 due = [m for m in masters if now >= next_poll.get(m["address"], 0)]
                 if due:
-                    # Prioritize WebSocket-notified wallets and run at most two
-                    # master polls concurrently. Per-wallet locks prevent overlaps.
-                    due.sort(key=lambda m: (m["address"] not in hot,
-                                            next_poll.get(m["address"], 0)))
-                    await asyncio.gather(*(self.poll_one(m, next_poll, burst)
-                                           for m in due))
+                    # Global RPC pacing handles concurrency, but serial polling
+                    # prevents large bursts of queued signature-page requests.
+                    for master in due:
+                        await self.poll_one(master, next_poll, burst)
             except asyncio.CancelledError:
                 raise
             except Exception:
