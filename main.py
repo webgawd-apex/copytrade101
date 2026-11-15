@@ -1,4 +1,4 @@
-"""Solana Telegram Copy Trader — single-file application."""
+"""Solana Telegram Copy Trader — single-file application (Speed-optimized build)."""
 import asyncio
 import base64
 import html
@@ -419,7 +419,8 @@ class BotService:
             SET status='QUEUED', message='Recovered after restart'
             WHERE status='QUOTING' AND signature IS NULL
         """)
-        await self.reconcile_all()
+        # Background reconcile so Telegram polling begins instantly on boot
+        asyncio.create_task(self.reconcile_all())
         paused = await self.pool.fetch("""
             UPDATE copy_users SET enabled=FALSE
             WHERE enabled AND id IN (
