@@ -428,7 +428,7 @@ class BotService:
             WHERE status IN ('SIGNED','SUBMITTED','UNKNOWN','SUBMITTING')
               AND COALESCE(signed_at, created_at) < now() - interval '15 minutes'
         """)
-        await self.reconcile_all()
+        asyncio.create_task(self.reconcile_all())
         paused = await self.pool.fetch("""
             UPDATE copy_users SET enabled=FALSE
             WHERE enabled AND id IN (
