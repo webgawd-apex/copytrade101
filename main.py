@@ -74,9 +74,7 @@ PORTAL_ALLOWED_PROGRAMS = {
     PUMP_PROGRAM, PUMPSWAP_PROGRAM, PUMP_FEE_PROGRAM, ATA_PROGRAM_ID,
     TOKEN_PROGRAM_ID, TOKEN_2022_ID, SYSTEM_ID, COMPUTE_BUDGET_ID,
 }
-SELL_PRIORITY_FEE_SOL = Decimal("0.0001")
-BUY_PRIORITY_FEE_SOL = Decimal("0.0008")
-PRIORITY_FEE_SOL = SELL_PRIORITY_FEE_SOL
+PRIORITY_FEE_SOL = Decimal("0.0001")
 MAX_PRIORITY_LAMPORTS = 5_000_000
 PORTAL_RENT_ALLOWANCE = 10_000_000
 SIGNATURE_EXPIRY_SECONDS = 120
@@ -380,7 +378,7 @@ class BotService:
         self.rpc_pace_lock = asyncio.Lock()
         self.rpc_next_at = 0.0
         self.rpc_cooldown_until = 0.0
-        self.rpc_spacing_seconds = 0.12  # ~8 req/s to stay safely below Helius rate limits
+        self.rpc_spacing_seconds = 0.05  # fast pacing (up to 20 req/s, well within Helius limits)
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
@@ -421,14 +419,7 @@ class BotService:
             SET status='QUEUED', message='Recovered after restart'
             WHERE status='QUOTING' AND signature IS NULL
         """)
-        # Resolve any stale unconfirmed trades older than 15 minutes so they don't block Auto Trade or spam RPC
-        await self.pool.execute("""
-            UPDATE copy_trades
-            SET status='REVIEW_REQUIRED', message='Expired prior to restart'
-            WHERE status IN ('SIGNED','SUBMITTED','UNKNOWN','SUBMITTING')
-              AND COALESCE(signed_at, created_at) < now() - interval '15 minutes'
-        """)
-        asyncio.create_task(self.reconcile_all())
+        await self.reconcile_all()
         paused = await self.pool.fetch("""
             UPDATE copy_users SET enabled=FALSE
             WHERE enabled AND id IN (
@@ -494,8 +485,7 @@ class BotService:
             if method != "sendTransaction":
                 async with self.rpc_pace_lock:
                     now = time.monotonic()
-                    is_bg = method in ("getSignaturesForAddress", "getTokenAccountsByOwner")
-                    ready = max(self.rpc_next_at, self.rpc_cooldown_until if is_bg else 0.0)
+                    ready = max(self.rpc_next_at, self.rpc_cooldown_until)
                     if ready > now:
                         await asyncio.sleep(ready - now)
                     self.rpc_next_at = time.monotonic() + self.rpc_spacing_seconds
@@ -1524,7 +1514,6 @@ class BotService:
     # ------------------------------------------------------------------ pumpportal
     async def portal_transaction(self, wallet, mint, side, amount, slip):
         """Third-party local builder. Never send private keys."""
-        fee = BUY_PRIORITY_FEE_SOL if side.upper() == "BUY" else SELL_PRIORITY_FEE_SOL
         args = {
             "publicKey": wallet,
             "action": side.lower(),
@@ -1532,7 +1521,7 @@ class BotService:
             "amount": amount if isinstance(amount, str) else str(amount),
             "denominatedInSol": "true" if side == "BUY" else "false",
             "slippage": float(Decimal(slip) / 100),
-            "priorityFee": float(fee),
+            "priorityFee": float(PRIORITY_FEE_SOL),
             "pool": "auto",
         }
         async with self.session.post(
@@ -1613,8 +1602,7 @@ class BotService:
         if not saw_pump:
             raise ValueError("Builder returned transaction without Pump/PumpSwap program")
         effective_limit = limit if limit is not None else 200_000 * max(1, non_budget)
-        max_priority = 8_000_000 if side == "BUY" else MAX_PRIORITY_LAMPORTS
-        if price * effective_limit // 1_000_000 > max_priority:
+        if price * effective_limit // 1_000_000 > MAX_PRIORITY_LAMPORTS:
             raise ValueError("Builder priority fee is too high")
         if side == "BUY":
             cap = int(spend_lamports * (10_000 + slip_bps) // 10_000) + PORTAL_RENT_ALLOWANCE
@@ -1770,34 +1758,20 @@ class BotService:
                 max_age = int(follower.get("max_signal_age_seconds") or 90)
                 if time.time() - block_time > max_age:
                     continue
-                can_fast_dispatch = len(self.inflight) < TRADE_CONCURRENCY
-                init_status = "QUOTING" if can_fast_dispatch else "QUEUED"
                 inserted = await self.pool.fetchrow("""
                     INSERT INTO copy_trades
                     (user_id,master_address,master_signature,side,mint,status,
                      block_time,fraction,venue)
-                    VALUES($1,$2,$3,$4,$5,$9,$6,$7,$8)
-                    ON CONFLICT DO NOTHING
-                    RETURNING id,user_id,master_address,master_signature,side,mint,
-                              fraction,block_time,venue,created_at,tp_position_id,
-                              tp_raw_amount,auto_exit_kind
+                    VALUES($1,$2,$3,$4,$5,'QUEUED',$6,$7,$8)
+                    ON CONFLICT DO NOTHING RETURNING id
                 """, follower["user_id"], address, signature, side, mint,
-                    int(block_time), fraction, venue, init_status)
+                    int(block_time), fraction, venue)
                 if inserted:
-                    if can_fast_dispatch:
-                        task = asyncio.create_task(self.run_trade(inserted))
-                        self.inflight.add(task)
-                        task.add_done_callback(self._trade_done)
-                        LOG.info(
-                            "⚡ Fast WS instant dispatch %s uid=%s mint=%s trade_id=%s venue=%s",
-                            side, follower["user_id"], shortened(mint), inserted["id"], venue
-                        )
-                    else:
-                        queued_any = True
-                        LOG.info(
-                            "⚡ Fast WS queued %s uid=%s mint=%s venue=%s",
-                            side, follower["user_id"], shortened(mint), venue
-                        )
+                    queued_any = True
+                    LOG.info(
+                        "⚡ Fast WS queued %s uid=%s mint=%s venue=%s",
+                        side, follower["user_id"], shortened(mint), venue
+                    )
             if queued_any:
                 self.trade_wake.set()
 
@@ -2200,11 +2174,9 @@ class BotService:
     async def reconcile_all(self):
         rows = await self.pool.fetch("""
             SELECT id,signature,signed_at FROM copy_trades
-            WHERE status IN ('SIGNED','SUBMITTED','SUBMITTING','UNKNOWN')
-              AND signature IS NOT NULL
-              AND COALESCE(signed_at, created_at) > now() - interval '15 minutes'
-            ORDER BY id DESC LIMIT 15
-        """)
+            WHERE status = ANY($1) AND signature IS NOT NULL
+            ORDER BY id DESC LIMIT 100
+        """, UNRESOLVED)
         for row in rows:
             try:
                 await self.reconcile_one(row["id"], row["signature"], row["signed_at"])
@@ -2213,8 +2185,7 @@ class BotService:
         wrows = await self.pool.fetch("""
             SELECT id,signature,created_at FROM copy_withdrawals
             WHERE status IN ('SUBMITTING','SUBMITTED','UNKNOWN') AND signature IS NOT NULL
-              AND created_at > now() - interval '15 minutes'
-            ORDER BY id LIMIT 10
+            ORDER BY id LIMIT 50
         """)
         for row in wrows:
             try:
@@ -2785,7 +2756,7 @@ class BotService:
 
     # ------------------------------------------------------------------ monitoring
     async def get_transaction(self, signature):
-        delays = [0.05, 0.10, 0.20, 0.35, 0.50]
+        delays = [0.08, 0.15, 0.25, 0.40, 0.60]
         for delay in delays:
             tx = await self.rpc("getTransaction", [
                 signature,
