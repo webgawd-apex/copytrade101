@@ -42,6 +42,8 @@ DSN = os.getenv("DATABASE_URL")
 JUP_KEY = os.getenv("JUPITER_API_KEY", "")
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or "0")
 RPC = os.getenv("HELIUS_RPC_URL", "").strip()
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", secrets.token_hex(16))
 if not TOKEN or not DSN or not RPC:
     raise SystemExit("Set TELEGRAM_TOKEN, DATABASE_URL and HELIUS_RPC_URL")
 parsed_rpc = urlsplit(RPC)
@@ -49,6 +51,8 @@ if (parsed_rpc.scheme != "https" or
         parsed_rpc.hostname != "mainnet.helius-rpc.com" or
         not parse_qs(parsed_rpc.query).get("api-key", [""])[0]):
     raise SystemExit("HELIUS_RPC_URL must be a valid Helius mainnet HTTPS RPC URL")
+HELIUS_API_KEY = parse_qs(parsed_rpc.query).get("api-key", [""])[0]
+HELIUS_WEBHOOK_API = "https://api.helius.xyz/v0/webhooks"
 
 JUP = "https://api.jup.ag/swap/v2"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -242,6 +246,10 @@ MIGRATIONS = (
     END $$""",
     "ALTER TABLE copy_users ALTER COLUMN use_pumpportal SET DEFAULT TRUE",
     "UPDATE copy_users SET use_pumpportal=TRUE WHERE use_pumpportal IS FALSE",
+    # Raise fallback-poll interval now that Helius webhooks handle real-time detection.
+    # 30 s fallback is plenty — webhooks fire in < 1 s; this just saves RPC credits.
+    "ALTER TABLE copy_users ALTER COLUMN poll_interval_seconds SET DEFAULT 30",
+    "UPDATE copy_users SET poll_interval_seconds=30 WHERE poll_interval_seconds < 10",
 )
 
 
@@ -372,13 +380,14 @@ class BotService:
         self.reconcile_task = None
         self.take_profit_task = None
         self.price_task = None
+        self.webhook_task = None
         self.tp_cursor = 0
         self.rpc_limit = asyncio.Semaphore(4)
         # Shared pacing/cooldown across ALL HTTP RPC users (monitoring + execution).
         self.rpc_pace_lock = asyncio.Lock()
         self.rpc_next_at = 0.0
         self.rpc_cooldown_until = 0.0
-        self.rpc_spacing_seconds = 0.05  # fast pacing (up to 20 req/s, well within Helius limits)
+        self.rpc_spacing_seconds = 0.12  # ~8 req/s — safely within free Helius limit
         self.trade_sem = asyncio.Semaphore(TRADE_CONCURRENCY)
         self.ws_signal = asyncio.Event()
         self.trade_wake = asyncio.Event()
@@ -391,6 +400,7 @@ class BotService:
         self.inflight = set()
         self.awaiting_resolution = set()
         self.notice_throttle = {}
+        self._webhook_addresses: set = set()  # populated by sync_helius_webhooks on startup
 
     # ------------------------------------------------------------------ lifecycle
     async def startup(self, app):
@@ -441,6 +451,8 @@ class BotService:
         self.reconcile_task = asyncio.create_task(self.reconcile_loop())
         self.take_profit_task = asyncio.create_task(self.take_profit_loop())
         self.price_task = asyncio.create_task(self.price_refresh_loop())
+        self.webhook_task = asyncio.create_task(self.webhook_server())
+        asyncio.create_task(self.sync_helius_webhooks())
         await app.bot.set_my_commands([
             BotCommand("start", "Open dashboard"),
             BotCommand("wallet", "Manage wallets"),
@@ -453,12 +465,12 @@ class BotService:
             BotCommand("help", "Show bot commands"),
             BotCommand("menu", "Open dashboard"),
         ])
-        LOG.info("Solana live copy bot started (WS + poll monitoring, DB-backed queue)")
+        LOG.info("Solana live copy bot started (webhook + WS + poll monitoring, DB-backed queue)")
 
     async def shutdown(self, app):
         for task in (self.monitor_task, self.cleanup_task, self.ws_task,
                      self.worker_task, self.reconcile_task, self.take_profit_task,
-                     self.price_task):
+                     self.price_task, self.webhook_task):
             if task:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -1629,6 +1641,139 @@ class BotService:
                 "maxRetries": 3,
             },
         ])
+
+    # ------------------------------------------------------------------ helius webhook server
+    async def webhook_server(self):
+        """Receive Helius push notifications on port WEBHOOK_PORT.
+
+        Helius POSTs an array of enhanced transaction objects the moment a
+        watched wallet transacts.  We validate the shared secret header, then
+        feed each signature directly into the existing handle_ws_signature path.
+        No polling credit is consumed.
+        """
+        from aiohttp import web
+
+        async def handle(request: web.Request) -> web.Response:
+            # Validate the shared secret so random internet traffic is ignored.
+            auth = request.headers.get("Authorization", "")
+            if WEBHOOK_SECRET and auth != WEBHOOK_SECRET:
+                return web.Response(status=401)
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.Response(status=400)
+            # Helius sends a list of enhanced transaction objects.
+            if isinstance(payload, list):
+                for item in payload:
+                    sig = item.get("signature") or (item.get("transaction") or {}).get("signatures", [None])[0]
+                    # accountData tells us which tracked address was involved.
+                    account_data = item.get("accountData") or []
+                    address = None
+                    for acct in account_data:
+                        acct_addr = acct.get("account")
+                        if acct_addr and acct_addr in self._webhook_addresses:
+                            address = acct_addr
+                            break
+                    if sig and address:
+                        asyncio.create_task(self.handle_ws_signature(sig, address))
+            return web.Response(status=200, text="ok")
+
+        runner = web.AppRunner(web.Application())
+        await runner.setup()
+        runner.app.router.add_post("/webhook", handle)
+        site = web.TCPSite(runner, "0.0.0.0", WEBHOOK_PORT)
+        try:
+            await site.start()
+            LOG.info("Helius webhook server listening on port %d", WEBHOOK_PORT)
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await runner.cleanup()
+            raise
+
+    async def sync_helius_webhooks(self):
+        """Register or update Helius webhooks for all active master wallets.
+
+        Called once on startup.  Uses the Helius Webhook API — free on all plans.
+        The bot's public IP is used as the webhook URL unless WEBHOOK_URL is set.
+        """
+        # Allow an explicit override, e.g. if behind a reverse proxy.
+        webhook_url_base = os.getenv("WEBHOOK_URL", "").strip()
+        if not webhook_url_base:
+            # Auto-detect the droplet's public IP from a lightweight metadata call.
+            try:
+                async with self.session.get(
+                    "http://checkip.amazonaws.com", timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    public_ip = (await resp.text()).strip()
+                webhook_url_base = f"http://{public_ip}:{WEBHOOK_PORT}/webhook"
+            except Exception as exc:
+                LOG.warning("Could not detect public IP for webhook registration (%s); set WEBHOOK_URL env var", type(exc).__name__)
+                return
+
+        # Fetch all active master wallet addresses.
+        rows = await self.pool.fetch("""
+            SELECT DISTINCT m.address FROM copy_masters m
+            JOIN copy_users u ON u.id = m.user_id
+            WHERE m.active AND u.enabled
+        """)
+        addresses = [r["address"] for r in rows]
+        self._webhook_addresses = set(addresses)
+
+        if not addresses:
+            LOG.info("No active master wallets — skipping Helius webhook registration")
+            return
+
+        # List existing webhooks to avoid duplicates.
+        try:
+            async with self.session.get(
+                f"{HELIUS_WEBHOOK_API}?api-key={HELIUS_API_KEY}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                existing = await resp.json(content_type=None) if resp.status == 200 else []
+        except Exception:
+            existing = []
+
+        # Find an existing webhook pointing to our URL.
+        our_webhook = next(
+            (w for w in (existing or []) if isinstance(w, dict) and w.get("webhookURL") == webhook_url_base),
+            None,
+        )
+
+        payload = {
+            "webhookURL": webhook_url_base,
+            "transactionTypes": ["ANY"],
+            "accountAddresses": addresses,
+            "webhookType": "raw",          # raw = lowest latency, we parse ourselves
+            "authHeader": WEBHOOK_SECRET,
+        }
+
+        try:
+            if our_webhook:
+                wid = our_webhook["webhookID"]
+                async with self.session.put(
+                    f"{HELIUS_WEBHOOK_API}/{wid}?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    ok = resp.status in (200, 201)
+            else:
+                async with self.session.post(
+                    f"{HELIUS_WEBHOOK_API}?api-key={HELIUS_API_KEY}",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    ok = resp.status in (200, 201)
+
+            if ok:
+                LOG.info(
+                    "Helius webhook registered for %d master wallet(s) → %s",
+                    len(addresses), webhook_url_base,
+                )
+            else:
+                LOG.warning("Helius webhook registration returned unexpected status (non-critical; polling remains active)")
+        except Exception as exc:
+            LOG.warning("Helius webhook registration failed (%s); polling remains active", type(exc).__name__)
 
     # ------------------------------------------------------------------ websocket
     async def websocket_monitor(self):
