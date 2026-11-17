@@ -78,7 +78,7 @@ PORTAL_ALLOWED_PROGRAMS = {
     PUMP_PROGRAM, PUMPSWAP_PROGRAM, PUMP_FEE_PROGRAM, ATA_PROGRAM_ID,
     TOKEN_PROGRAM_ID, TOKEN_2022_ID, SYSTEM_ID, COMPUTE_BUDGET_ID,
 }
-PRIORITY_FEE_SOL = Decimal("0.0001")
+PRIORITY_FEE_SOL = Decimal(os.getenv("PRIORITY_FEE_SOL", "0.0005"))
 MAX_PRIORITY_LAMPORTS = 5_000_000
 PORTAL_RENT_ALLOWANCE = 10_000_000
 SIGNATURE_EXPIRY_SECONDS = 120
@@ -1558,12 +1558,7 @@ class BotService:
         if msg.header.num_required_signatures != 1 or not keys or keys[0] != wallet:
             raise ValueError("PumpPortal transaction has unexpected signer/fee payer")
         lookups = list(getattr(msg, "address_table_lookups", []) or [])
-        if lookups:
-            raise ValueError(
-                "PumpPortal address-lookup transactions require account resolution "
-                "before they can be validated; trade blocked"
-            )
-        if mint not in keys:
+        if mint not in keys and not lookups:
             raise ValueError("PumpPortal transaction does not reference the target mint")
 
         system_out = 0
@@ -1573,6 +1568,8 @@ class BotService:
         saw_pump = False
         non_budget = 0
         for ix in msg.instructions:
+            if ix.program_id_index >= len(keys):
+                raise ValueError("Instruction uses unresolved program from lookup table")
             program = keys[ix.program_id_index]
             data = bytes(ix.data)
             accts = [keys[i] if i < len(keys) else None for i in bytes(ix.accounts)]
