@@ -4,3 +4,5 @@ asyncpg>=0.30,<1
 solders>=0.26,<1
 cryptography>=44,<47
 base58>=2.1,<3
+grpcio>=1.60
+grpcio-tools>=1.60

@@ -18,6 +18,15 @@ from urllib.parse import urlsplit, parse_qs
 import aiohttp
 import asyncpg
 import base58
+try:
+    import grpc
+    import sys as _sys
+    _sys.path.insert(0, "/opt/tg-bot")
+    import geyser_pb2
+    import geyser_pb2_grpc
+    _GRPC_AVAILABLE = True
+except ImportError:
+    _GRPC_AVAILABLE = False
 from cryptography.fernet import Fernet
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -53,6 +62,7 @@ if (parsed_rpc.scheme != "https" or
     raise SystemExit("HELIUS_RPC_URL must be a valid Helius mainnet HTTPS RPC URL")
 HELIUS_API_KEY = parse_qs(parsed_rpc.query).get("api-key", [""])[0]
 HELIUS_WEBHOOK_API = "https://api.helius.xyz/v0/webhooks"
+YELLOWSTONE_ENDPOINT = os.getenv("YELLOWSTONE_ENDPOINT", "")  # e.g. 88.216.36.108:10001
 
 JUP = "https://api.jup.ag/swap/v2"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -446,6 +456,7 @@ class BotService:
             )
         self.monitor_task = asyncio.create_task(self.monitor())
         self.ws_task = asyncio.create_task(self.websocket_monitor())
+        self.grpc_task = asyncio.create_task(self.yellowstone_monitor())
         self.cleanup_task = asyncio.create_task(self.cleanup_keys())
         self.worker_task = asyncio.create_task(self.trade_worker())
         self.reconcile_task = asyncio.create_task(self.reconcile_loop())
@@ -1866,6 +1877,93 @@ class BotService:
                 )
             await asyncio.sleep(backoff)
             backoff = min(30, backoff * 2)
+
+    # ------------------------------------------------------------------ yellowstone gRPC
+    async def yellowstone_monitor(self):
+        """Yellowstone gRPC stream — fastest possible signal path for master wallet txs."""
+        if not _GRPC_AVAILABLE:
+            LOG.info("Yellowstone gRPC: grpcio not installed, skipping")
+            return
+        if not YELLOWSTONE_ENDPOINT:
+            LOG.info("Yellowstone gRPC: YELLOWSTONE_ENDPOINT not set, skipping")
+            return
+
+        backoff = 1
+        while True:
+            try:
+                LOG.info("Yellowstone gRPC: connecting to %s", YELLOWSTONE_ENDPOINT)
+                channel = grpc.aio.insecure_channel(YELLOWSTONE_ENDPOINT)
+                stub = geyser_pb2_grpc.GeyserStub(channel)
+
+                async def request_generator(addresses):
+                    """Send one subscribe request then keep the stream alive with pings."""
+                    tx_filter = geyser_pb2.SubscribeRequestFilterTransactions(
+                        vote=False,
+                        failed=False,
+                        account_include=list(addresses),
+                    )
+                    req = geyser_pb2.SubscribeRequest(
+                        transactions={"copytrade": tx_filter},
+                        commitment=geyser_pb2.CommitmentLevel.CONFIRMED,
+                    )
+                    yield req
+                    # Keep stream alive
+                    ping_id = 0
+                    while True:
+                        await asyncio.sleep(10)
+                        ping_id += 1
+                        yield geyser_pb2.SubscribeRequest(
+                            ping=geyser_pb2.SubscribeRequestPing(id=ping_id)
+                        )
+
+                # Fetch master wallet addresses
+                rows = await self.pool.fetch("""
+                    SELECT DISTINCT m.address
+                    FROM copy_masters m
+                    JOIN copy_users u ON u.id=m.user_id
+                    WHERE m.active AND u.enabled
+                """)
+                addresses = [r["address"] for r in rows]
+                if not addresses:
+                    LOG.info("Yellowstone gRPC: no active master wallets, retrying in 30s")
+                    await asyncio.sleep(30)
+                    continue
+
+                LOG.info("Yellowstone gRPC: subscribing to %d wallet(s)", len(addresses))
+                backoff = 1
+
+                async for update in stub.Subscribe(request_generator(addresses)):
+                    if update.HasField("transaction"):
+                        tx_info = update.transaction.transaction
+                        sig_bytes = tx_info.signature
+                        if not sig_bytes:
+                            continue
+                        signature = base58.b58encode(sig_bytes).decode()
+                        # Find which master wallet is involved
+                        msg = tx_info.transaction.message
+                        all_keys = list(msg.account_keys)
+                        matched_addr = None
+                        for key_bytes in all_keys:
+                            key_str = base58.b58encode(key_bytes).decode()
+                            if key_str in addresses:
+                                matched_addr = key_str
+                                break
+                        if matched_addr and signature not in self.seen_signatures:
+                            LOG.debug("Yellowstone gRPC: tx %s for %s",
+                                      shortened(signature), shortened(matched_addr))
+                            asyncio.create_task(
+                                self.handle_ws_signature(signature, matched_addr)
+                            )
+                    elif update.HasField("ping"):
+                        pass  # heartbeat, ignore
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.warning("Yellowstone gRPC error (%s: %s); reconnecting in %ds",
+                            type(exc).__name__, exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(60, backoff * 2)
 
     async def handle_ws_signature(self, signature, address):
         """Ultra-low-latency direct path for confirmed WebSocket log notifications."""
